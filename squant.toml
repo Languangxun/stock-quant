@@ -19,11 +19,13 @@ dependencies = [
     "PyMySQL>=1.0.0",
     "akshare>=1.14.0",
     "yfinance>=0.2.40",
+    "lunardate>=0.3.0",
     'tomli>=2.0.0; python_version < "3.11"',
 ]
 
 [project.scripts]
 stock-quant = "main:cli"
+poolmgr = "poolmgr:poolmgr"
 
 [tool.stock-quant]
 position_style = "full"
@@ -79,7 +81,7 @@ bollinger = 0.1
 quality_value = 0.1
 
 [tool.setuptools]
-py-modules = ["main", "_version"]
+py-modules = ["main", "poolmgr", "_version"]
 packages = ["core", "strategies", "visualization"]
 
 [tool.setuptools.dynamic]

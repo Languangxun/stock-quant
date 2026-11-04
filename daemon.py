@@ -3,18 +3,22 @@
 """每日定时守护进程
 
 用法：
-    python3 daemon.py [-t HHMM] [-arg "ARGs"]
+    python3 daemon.py [-t HHMM[,HHMM...]] [-arg "ARGs"]
 
 选项：
-    -t HHMM      每天执行时间。省略时在 14:30 和 14:50 各执行一次；
-                 指定后仅在指定时间执行一次
-    -arg ARGs    传递给 main.py 的参数，默认
+    -t HHMM[,HHMM...]
+                 每天执行时间，多个用逗号分隔（如 0830,1430）；
+                 省略时在 08:30 和 14:35 各执行一次；
+                 周六、周日不执行
+    -arg ARGs    传递给 analyze 的参数，默认
                  "analyze -sf input/big.txt -g boll,macd"
+                 到达执行时间后，先运行 analyze，再运行
+                 "scan --random --nost --notify"
 
 示例：
     python3 daemon.py
-    python3 daemon.py -t 1450
-    python3 daemon.py -t 1445 -arg "scan --random -g all --notify"
+    python3 daemon.py -t 0830,1430
+    python3 daemon.py -t 1445 -arg "analyze -sf input/pool.txt -g all --notify"
 """
 
 import argparse
@@ -25,11 +29,46 @@ import sys
 import time
 from datetime import datetime
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+def _resolve_project_root():
+    if not getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(__file__))
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    for path in (os.getcwd(), exe_dir, os.path.dirname(exe_dir)):
+        if path and os.path.isfile(os.path.join(path, 'squant.toml')):
+            return path
+    return exe_dir
+
+
+PROJECT_ROOT = _resolve_project_root()
 MAIN_PATH = os.path.join(PROJECT_ROOT, 'main.py')
-DEFAULT_RUN_TIMES = ('1430', '1450')
-DEFAULT_ARGS = 'analyze -sf input/big.txt -g boll,macd --notify'
+DEFAULT_RUN_TIMES = ('0830', '1435')
+DEFAULT_ARGS = 'analyze -sf input/pool.txt -g boll,macd --notify'
+SCAN_ARGS = ('scan', '--random', '--nost', '--notify')
 POLL_SECONDS = 20
+
+
+def _find_squant():
+    """预编译 daemon 查找同目录/项目 bin 目录下的 squant。"""
+    if not getattr(sys, 'frozen', False):
+        return None
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    for path in (os.path.join(exe_dir, 'squant'),
+                 os.path.join(PROJECT_ROOT, 'bin', 'squant'),
+                 os.path.join(PROJECT_ROOT, 'squant')):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _build_main_cmd(main_args):
+    if getattr(sys, 'frozen', False):
+        squant = _find_squant()
+        if not squant:
+            raise RuntimeError(
+                '未找到 squant 可执行文件（应位于 daemon 同目录或项目 bin/ 目录）')
+        return [squant] + main_args
+    return [sys.executable, MAIN_PATH] + main_args
 
 
 def _parse_run_time(value):
@@ -42,43 +81,64 @@ def _parse_run_time(value):
     return value
 
 
+def _parse_run_times(value):
+    parts = [p.strip() for p in str(value).split(',') if p.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError('至少指定一个执行时间')
+    times = [_parse_run_time(p) for p in parts]
+    return tuple(dict.fromkeys(times))
+
+
 def _log(message):
     print(f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] {message}', flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description='每天定时调用 main.py')
-    parser.add_argument('-t', dest='run_time', type=_parse_run_time,
+    parser.add_argument('-t', dest='run_time', type=_parse_run_times,
                         default=None,
-                        help='执行时间 HHMM；省略时在 14:30、14:50 各执行一次')
+                        help='执行时间 HHMM，多个用逗号分隔（如 0830,1430）；'
+                             '省略时在 08:30、14:35 各执行一次')
     parser.add_argument('-arg', dest='main_args', default=DEFAULT_ARGS,
-                        help=f'传递给 main.py 的参数（默认 "{DEFAULT_ARGS}"）')
+                        help=f'传递给 analyze 的参数（默认 "{DEFAULT_ARGS}"）')
     args = parser.parse_args()
 
     os.chdir(PROJECT_ROOT)
-    run_times = (args.run_time,) if args.run_time else DEFAULT_RUN_TIMES
+    run_times = args.run_time if args.run_time else DEFAULT_RUN_TIMES
     main_args = shlex.split(args.main_args)
+    try:
+        base_cmd = _build_main_cmd([])
+    except Exception as exc:
+        _log(f'无法启动: {exc}')
+        return
+    analyze_cmd = base_cmd + main_args
+    scan_cmd = base_cmd + list(SCAN_ARGS)
     run_time_labels = '、'.join(f'{t[:2]}:{t[2:]}' for t in run_times)
     run_times_set = set(run_times)
     ran_date = None
     ran_today = set()
-    _log(f'守护进程已启动，每天 {run_time_labels} 执行: '
-         f'{sys.executable} main.py {" ".join(main_args)}'.rstrip())
+    _log(f'守护进程已启动，每天 {run_time_labels} 执行:')
+    _log(f'  1) {" ".join(analyze_cmd)}')
+    _log(f'  2) {" ".join(scan_cmd)}')
 
     while True:
         now = datetime.now()
         if now.date() != ran_date:
             ran_date = now.date()
             ran_today = set()
+        if now.weekday() >= 5:
+            time.sleep(POLL_SECONDS)
+            continue
         now_hhmm = now.strftime('%H%M')
         if now_hhmm in run_times_set and now_hhmm not in ran_today:
-            cmd = [sys.executable, MAIN_PATH] + main_args
-            _log(f'到达执行时间 {now_hhmm[:2]}:{now_hhmm[2:]}，开始运行: ' + ' '.join(cmd))
-            try:
-                proc = subprocess.run(cmd, cwd=PROJECT_ROOT)
-                _log(f'运行完成，退出码={proc.returncode}')
-            except Exception as exc:
-                _log(f'运行异常: {exc}')
+            for label, cmd in (('analyze', analyze_cmd), ('scan', scan_cmd)):
+                _log(f'到达执行时间 {now_hhmm[:2]}:{now_hhmm[2:]}，开始运行 {label}: '
+                     + ' '.join(cmd))
+                try:
+                    proc = subprocess.run(cmd, cwd=PROJECT_ROOT)
+                    _log(f'{label} 完成，退出码={proc.returncode}')
+                except Exception as exc:
+                    _log(f'{label} 运行异常: {exc}')
             ran_today.add(now_hhmm)
         time.sleep(POLL_SECONDS)
 

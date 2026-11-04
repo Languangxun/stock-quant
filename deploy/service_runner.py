@@ -62,6 +62,11 @@ def main():
                 print(f'[{now.strftime("%Y-%m-%d %H:%M:%S")}] 已超过 {RUN_TIME}，运行: {" ".join(cmd)}', flush=True)
                 proc = subprocess.run(cmd, cwd=PROJECT_ROOT)
 
+                cmd = [sys.executable, 'main.py', 'scan',
+                       '--random', '--nost', '-g', STRATEGY, '--notify']
+                print(f'[{now.strftime("%Y-%m-%d %H:%M:%S")}] 已超过 {RUN_TIME}，运行: {" ".join(cmd)}', flush=True)
+                proc = subprocess.run(cmd, cwd=PROJECT_ROOT)
+
                 print(f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] 本轮完成，退出码={proc.returncode}', flush=True)
                 last_run_date = now.date()
         except Exception as e:

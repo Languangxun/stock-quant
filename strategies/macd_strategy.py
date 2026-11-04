@@ -47,11 +47,11 @@ class MACDStrategy(Strategy):
             slow (int): 慢速 EMA 周期，默认 26
             signal (int): 信号线 DEA 的 EMA 周期，默认 9
             rsi_buy_max (float): 买入附加条件 RSI < rsi_buy_max（None 表示不启用；
-                未传参时读取 pyproject.toml 的 MIN_RSI_THRESHOLD）
+                未传参时读取 squant.toml 的 MIN_RSI_THRESHOLD）
             rsi_sell_min (float): 卖出附加条件 RSI > rsi_sell_min（None 表示不启用；
-                未传参时读取 pyproject.toml 的 MAX_RSI_THRESHOLD）
+                未传参时读取 squant.toml 的 MAX_RSI_THRESHOLD）
             max_drawdown (float): 最大回撤止损阈值（0.15 表示 15%；None 表示不启用；
-                未传参时读取 pyproject.toml 的 MAX_DRAWDWON_THRESHOLD）
+                未传参时读取 squant.toml 的 MAX_DRAWDWON_THRESHOLD）
             name (str): 策略名称
         """
         super().__init__(name=name)

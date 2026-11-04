@@ -24,7 +24,7 @@
 >
 > **RSI 过滤已内置**：MA1030 / EMA1030 / MACD / BOLL / MA310 / MA520 / EMA520 的买入条件统一附加
 > `RSI < MIN_RSI_THRESHOLD`（且条件），卖出条件统一附加 `或 RSI > MAX_RSI_THRESHOLD`（RSI 优先取 `RSI14`，
-> 缺失时用 `calc_rsi(df,14)` 现算）。阈值来自 `pyproject.toml` 的 `[tool.stock-quant.thresholds]`（见 0.4），因此独立的 RSI 策略已取消注册。
+> 缺失时用 `calc_rsi(df,14)` 现算）。阈值来自 `squant.toml` 的 `[tool.stock-quant.thresholds]`（见 0.4），因此独立的 RSI 策略已取消注册。
 >
 > **全局买入附加条件**：所有策略的买入信号（`>0`）统一附加「当日涨幅 < 9.9%」。若 `close.pct_change() >= 9.9%`，
 > 该日买入信号被置为观望；卖出/观望信号不受影响。该过滤在信号生成后集中执行（`_filter_buy_on_big_gain`），
@@ -50,6 +50,9 @@
 > 入场后的买入信号重新从 1 计数。`N=0` 表示不过滤；`N>0` 时仅保留第 N 次买入信号，其余买入按观望处理；
 > 卖出信号不受影响、始终保留。**其它策略忽略该选项，始终按 `N=0` 处理。**
 >
+> **最大持股天数 `--maxholddays N`**：自建仓后的首次买入开始按交易日计数，持仓期间重复买入不会重置计时；
+> 持有时间**超过 N 个交易日、收盘价低于 BOLL 中线且持仓期最大回撤 >10%** 时才生成卖出信号。未持仓时的买入视为新建仓；`N` 缺省表示不限制。
+>
 > **in_pos 同步**：BOLL / SG1 / SG2 / SG3 在 `generate_signals` 内部直接应用「当日涨幅 < 9.9%」
 > 过滤（BOLL 还同步 `-sn`），`in_pos` 只在买入信号实际生效后置位。被过滤的买入不会被视为已入场，
 > 因此不会抑制后续买入，也不会产生依赖未入场持仓的孤立卖出（例如 2026-07-21 涨幅超限被取消后，
@@ -66,6 +69,7 @@
 | 技术指标类 | MA1030 策略 | `ma1030` | 个股 / ETF |
 | 技术指标类 | EMA1030 策略 | `ema1030` | 个股 / ETF |
 | 技术指标类 | MACD 策略 | `macd` | 个股 / ETF |
+| 技术指标类 | MACD1 策略（MACD 参数 6/13/5 版本） | `macd1` | 个股 / ETF |
 | 技术指标类 | KDJ 策略 | `kdj` | 个股 / ETF |
 | 技术指标类 | SAR 抛物线转向策略 | `sar` | 个股 / ETF |
 | 技术指标类 | 布林带策略 | `boll` | 个股 / ETF |
@@ -109,9 +113,9 @@
   baostock 走最近交易日全市场快照。Baostock 不提供总市值，`--nolowcap`/市值排序在该源下不生效并给出警告。
 - 实现见 `core/data_fetcher.py`（`set_primary_source` / `_get_a_stock_data` / `get_stock_list`），数据格式详见 `doc/data_structure.md`。
 
-### 0.4 统一阈值配置（`pyproject.toml` 的 `[tool.stock-quant.thresholds]`）
+### 0.4 统一阈值配置（`squant.toml` 的 `[tool.stock-quant.thresholds]`）
 
-阈值集中在 `pyproject.toml` 的 `[tool.stock-quant.thresholds]` 节，策略未显式传参时自动读取（`core/thresholds.py`），**以配置当前值为准**：
+阈值集中在 `squant.toml` 的 `[tool.stock-quant.thresholds]` 节，策略未显式传参时自动读取（`core/thresholds.py`），**以配置当前值为准**：
 
 | 配置项 | 代码回退默认 | 作用 |
 |------|:---:|------|
@@ -233,6 +237,14 @@
 | `max_drawdown` | 配置 `MAX_DRAWDWON_THRESHOLD` / 100 | 买入后自最高收盘价回撤 ≥ 阈值止损卖出（`None` 不启用） |
 
 **设计要点：** 金叉时 `DIF > DEA` 恒成立，故 `MACD柱 > 0` 为冗余条件已省略；买卖附加 RSI 过滤（`RSI<MIN_RSI_THRESHOLD` / `RSI>MAX_RSI_THRESHOLD`）以抑制过热追高与提前离场。RSI 已并入金叉/死叉定义。买入后逐日跟踪最高收盘价，回撤达到 `MAX_DRAWDWON_THRESHOLD` 时优先卖出。
+
+**MACD1 变体：** `-g macd1` 与 `macd` 的逻辑、过滤和风控完全相同，仅默认参数改为：
+
+```text
+fast=6, slow=13, signal=5
+```
+
+ETF 专用模式下 `macd1` 同样使用该默认参数。
 
 ---
 
@@ -458,7 +470,7 @@ z_t = (combined_smooth,t - μ_window) / σ_window
 
 综合策略（`composite`）已从 CLI 注册表移除：`-g composite` 不可用，`ALL_STRATEGIES` 不再包含它，
 `analyze` 的 DB/综合构建分支一并删除。源码 `strategies/composite_strategy.py` 保留供参考与历史脚本使用，
-`pyproject.toml` 的 `[tool.stock-quant.composite]` 配置段不再被 CLI 读取。
+`squant.toml` 的 `[tool.stock-quant.composite]` 配置段不再被 CLI 读取。
 
 ---
 

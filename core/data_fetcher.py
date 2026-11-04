@@ -17,12 +17,14 @@ import socket
 import threading
 import time
 from functools import lru_cache
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 
 import numpy as np
 import pandas as pd
 import requests
+
+from core.trading_calendar import is_ignored_gap_range
 
 # 配置模块级日志
 logger = logging.getLogger(__name__)
@@ -52,6 +54,7 @@ _SPEED_PROBE_TIMEOUT = 4.0
 
 
 def _probe_sina(timeout: float) -> float:
+    """获取新浪最小 K 线，必须拿到有效行情才算成功。"""
     url = (
         'https://quotes.sina.com.cn/cn/api/json_v2.php/'
         'CN_MarketData.getKLineData?symbol=sh600036&scale=240&ma=no&datalen=1'
@@ -59,44 +62,91 @@ def _probe_sina(timeout: float) -> float:
     t0 = time.perf_counter()
     resp = requests.get(url, headers=HEADERS, timeout=timeout)
     resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list) or not data:
+        raise RuntimeError('sina 返回空 K 线')
+    bar = data[-1]
+    required = ('day', 'open', 'high', 'low', 'close', 'volume')
+    if not isinstance(bar, dict) or any(k not in bar for k in required):
+        raise RuntimeError('sina K 线字段不完整')
+    if not bar['day']:
+        raise RuntimeError('sina K 线日期为空')
+    for key in ('open', 'high', 'low', 'close', 'volume'):
+        float(bar[key])
     return time.perf_counter() - t0
 
 
 def _probe_eastmoney(timeout: float) -> float:
+    """获取东方财富最小 K 线，必须拿到有效行情才算成功。"""
     url = (
         'https://push2his.eastmoney.com/api/qt/stock/kline/get?'
         'secid=1.600036&ut=fa5fd1943c7b386f172d6893dbfba10b'
-        '&fields1=f1,f2&fields2=f51,f52&klt=101&fqt=0'
-        '&beg=20240101&end=20240105'
+        '&fields1=f1,f2&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0'
+        '&beg=20240101&end=20240110'
     )
     t0 = time.perf_counter()
     resp = requests.get(
         url, timeout=timeout,
         headers={'Referer': 'https://quote.eastmoney.com/'})
     resp.raise_for_status()
+    payload = resp.json()
+    klines = ((payload.get('data') or {}).get('klines') or [])
+    if not klines:
+        raise RuntimeError('eastmoney 返回空 K 线')
+    parts = str(klines[-1]).split(',')
+    if len(parts) < 6 or not parts[0]:
+        raise RuntimeError('eastmoney K 线字段不完整')
+    for value in parts[1:6]:
+        float(value)
     return time.perf_counter() - t0
 
 
 def _probe_baostock(timeout: float) -> float:
-    host, port = 'public-api.baostock.com', 10030
+    """登录 Baostock 并读取一根最小 K 线，必须成功取到行情才算可用。"""
     try:
-        from baostock.common import contants as _bs_cons
-        host = getattr(_bs_cons, 'BAOSTOCK_SERVER_IP', host)
-        port = getattr(_bs_cons, 'BAOSTOCK_SERVER_PORT', port)
-    except Exception:
-        pass
+        import baostock as bs
+    except ImportError as exc:
+        raise RuntimeError('baostock 未安装') from exc
+
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
     t0 = time.perf_counter()
-    sock = socket.create_connection((host, port), timeout=timeout)
     try:
+        # 注意：不要在测速线程里使用 contextlib.redirect_stdout，
+        # 它是进程级全局状态，可能吞掉主线程后续输出。
+        login = bs.login()
+        if getattr(login, 'error_code', '0') != '0':
+            raise RuntimeError(
+                f"baostock 登录失败: {getattr(login, 'error_msg', '')}")
+
+        rs = bs.query_history_k_data_plus(
+            'sh.600036', 'date,open,high,low,close,volume',
+            start_date='2024-01-02', end_date='2024-01-02',
+            frequency='d', adjustflag='3')
+        if getattr(rs, 'error_code', '0') != '0':
+            raise RuntimeError(
+                f"baostock 查询失败: {getattr(rs, 'error_msg', '')}")
+        if not rs.next():
+            raise RuntimeError('baostock 返回空 K 线')
+        row = rs.get_row_data()
+        if len(row) < 6 or not row[1] or not row[2]:
+            raise RuntimeError('baostock K 线字段不完整')
+        for value in row[1:6]:
+            float(value)
         return time.perf_counter() - t0
     finally:
-        sock.close()
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        socket.setdefaulttimeout(old_timeout)
 
 
 def run_source_speed_test(force: bool = False):
-    """并行访问 sina / baostock / eastmoney，返回最先成功响应的数据源。
+    """并行读取各源的最小 K 线，返回最先成功拿到行情的数源。
 
-    一旦某个源最先返回成功结果，立即中断其余源的测速（不再等待/排名）。
+    仅 HTTP 连上或 socket 可连接不算成功：必须真正解析出至少一根 K 线
+    且行情字段有效。一旦某个源最先成功返回，立即中断其余测速。
     结果缓存在模块级，force=True 可强制重新测速；全部失败时返回 None。
     """
     global _SPEED_FASTEST, _SPEED_TEST_DONE
@@ -120,20 +170,32 @@ def run_source_speed_test(force: bool = False):
             for name, fn in probes.items()
         }
         fastest = None
+        best_elapsed = None
+        done = set()
+        not_done = set()
         try:
-            for fut in _cf.as_completed(futures):
-                name = futures[fut]
-                try:
-                    elapsed = fut.result()
-                except Exception as e:
-                    logger.warning("数据源测速失败 %s: %s", name, e)
-                    continue
-                fastest = name
-                logger.info("数据源测速: 最快为 %s (%.3fs)，中断其余测速", name, elapsed)
-                break
+            # 等待所有探测完成（或超时），再在成功拿到最小 K 线的源中取最快者。
+            # 这样也能确保测速线程结束，避免与后续 baostock 登录/fork 产生竞争。
+            done, not_done = _cf.wait(
+                futures, timeout=_SPEED_PROBE_TIMEOUT + 2)
         finally:
-            # 取消尚未开始的探测；已在执行的探测不再等待（wait=False）
+            for fut in not_done:
+                fut.cancel()
             ex.shutdown(wait=False, cancel_futures=True)
+
+        for fut in done:
+            name = futures[fut]
+            try:
+                elapsed = fut.result()
+            except Exception as e:
+                logger.warning("数据源测速失败 %s: %s", name, e)
+                continue
+            if best_elapsed is None or elapsed < best_elapsed:
+                best_elapsed = elapsed
+                fastest = name
+        if fastest is not None:
+            logger.info("数据源测速: 最快为 %s (%.3fs, 已获取最小 K 线)",
+                        fastest, best_elapsed)
 
         _SPEED_FASTEST = fastest
         _SPEED_TEST_DONE = True
@@ -222,6 +284,7 @@ class DataFetcher:
         self._setup_logging(log_level)
         self._session = requests.Session()
         self._session.headers.update(HEADERS)
+        self._listed_date_cache = {}
         self._check_dependencies()
 
     def _setup_logging(self, log_level: int) -> None:
@@ -346,7 +409,8 @@ class DataFetcher:
         获取A股历史数据。数据库与网络均只处理原始价格，复权在内存中完成。
 
         数据流程:
-        - 结束日期为当天：直接从网络获取原始K线（不回写数据库），再在内存中复权；
+        - 结束日期为当天：昨天及以前从数据库读取（缺口补齐），今天通过实时行情/网络获取；
+          今天的数据只参与内存计算，不回写数据库；
         - 结束日期非当天：先读数据库原始K线，检查完整性（起始/结束偏差、中间间隙 > 3 天），
           仅对缺失时段从网络补齐并回写数据库，最后在内存中复权；
         - 网络通道按首选源 + 备用源链回退。
@@ -356,17 +420,83 @@ class DataFetcher:
         """
         raw_symbol = self._normalize_a_stock_symbol(symbol)
 
-        # 结束日期为当天：直接全量走网络原始行情（不读库、不回写）
         today = datetime.now().strftime('%Y%m%d')
         if end_date == today:
-            logger.info("结束日期为当天，直接从网络获取原始K线: %s", raw_symbol)
-            df_raw = self._fetch_from_network_chain(
-                raw_symbol, start_date, end_date, write_db=False)
+            logger.info("结束日期为当天，历史取库、今日取实时: %s", raw_symbol)
+            yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+            frames = []
+
+            if start_date <= yesterday:
+                df_hist = self._get_a_stock_data_db_first(
+                    raw_symbol, start_date, yesterday, gap_days=0)
+                if df_hist is not None and not df_hist.empty:
+                    last_hist = pd.to_datetime(df_hist['date']).max()
+                    tail_start = (last_hist + pd.Timedelta(days=1)).strftime('%Y%m%d')
+                    if tail_start <= yesterday:
+                        # 数据库整体尚未更新到昨天时，交易日历也会缺失该日；
+                        # 这里强制补最后一段历史数据（节假日请求会返回空，不会误写）。
+                        df_tail = self._fetch_from_network_chain(
+                            raw_symbol, tail_start, yesterday, write_db=True)
+                        if df_tail is not None and not df_tail.empty:
+                            df_hist = pd.concat([df_hist, df_tail], ignore_index=True)
+                            df_hist = (df_hist.drop_duplicates(subset=['date'], keep='last')
+                                       .sort_values('date').reset_index(drop=True))
+                    frames.append(df_hist)
+
+            df_today = self._get_today_realtime_bar(raw_symbol)
+            if df_today.empty:
+                # 实时接口失败时，再用网络 K 线通道取今日数据，仍不回写
+                df_today = self._fetch_from_network_chain(
+                    raw_symbol, today, today, write_db=False)
+                if df_today is not None and not df_today.empty:
+                    today_dt = pd.to_datetime(df_today['date']).dt.strftime('%Y%m%d')
+                    df_today = df_today[today_dt == today]
+            if df_today is not None and not df_today.empty:
+                frames.append(df_today)
+
+            if frames:
+                df_raw = pd.concat(frames, ignore_index=True)
+                df_raw = df_raw.drop_duplicates(subset=['date'], keep='last')
+                df_raw = df_raw.sort_values('date').reset_index(drop=True)
+            else:
+                df_raw = pd.DataFrame()
             return self._apply_in_memory_adjust(df_raw, raw_symbol, adjust)
 
         # 结束日期非当天：数据库原始K线优先 + 缺口补齐，再于内存复权
         df_raw = self._get_a_stock_data_db_first(raw_symbol, start_date, end_date)
         return self._apply_in_memory_adjust(df_raw, raw_symbol, adjust)
+
+    def _get_today_realtime_bar(self, symbol: str) -> pd.DataFrame:
+        """获取今日实时行情并转换为单行原始 K 线（日期非今天则返回空）。"""
+        quote = self.get_realtime_quote(symbol)
+        if not quote:
+            return pd.DataFrame()
+
+        price = quote.get('price') or 0
+        if price <= 0:
+            return pd.DataFrame()
+
+        dt_text = quote.get('datetime')
+        if not dt_text:
+            return pd.DataFrame()
+        try:
+            quote_date = pd.to_datetime(dt_text).date()
+        except Exception:
+            return pd.DataFrame()
+        if quote_date != datetime.now().date():
+            return pd.DataFrame()
+
+        row = {
+            'date': pd.Timestamp(quote_date),
+            'open': quote.get('open') or price,
+            'high': quote.get('high') or price,
+            'low': quote.get('low') or price,
+            'close': price,
+            'volume': quote.get('volume') or 0,
+            'amount': quote.get('amount'),
+        }
+        logger.info("获取 %s 今日实时K线: price=%.3f", symbol, price)
+        return pd.DataFrame([row])
 
     def _apply_in_memory_adjust(
         self, df: pd.DataFrame, symbol: str, adjust: str = 'qfq'
@@ -450,11 +580,27 @@ class DataFetcher:
 
         return pd.DataFrame()
 
+    def _get_listed_date(self, symbol: str):
+        """读取股票上市日期；数据库无记录或字段为空时返回 None。"""
+        if symbol in self._listed_date_cache:
+            return self._listed_date_cache[symbol]
+        listed = None
+        try:
+            from core.db import fetch_stock_info
+            info = fetch_stock_info(symbol, force=True)
+            if info and info.get('listed_date'):
+                listed = pd.to_datetime(info['listed_date']).date()
+        except Exception as e:
+            logger.debug("读取上市日期失败(%s): %s", symbol, e)
+        self._listed_date_cache[symbol] = listed
+        return listed
+
     def _get_a_stock_data_db_first(
         self,
         symbol: str,
         start_date: str,
-        end_date: str
+        end_date: str,
+        gap_days: int = 3
     ) -> pd.DataFrame:
         """先读数据库原始K线，检查完整性，仅对缺失时段从网络补齐并回写数据库。"""
         start_dt = pd.to_datetime(start_date)
@@ -466,20 +612,50 @@ class DataFetcher:
             return self._fetch_from_network_chain(
                 symbol, start_date, end_date, write_db=True)
 
-        missing = self._find_missing_ranges(df_db['date'], start_dt, end_dt)
+        missing = self._find_missing_ranges(df_db['date'], start_dt, end_dt,
+                                            gap_days=gap_days)
         if missing:
-            # 过滤掉完全由非交易日构成的缺口（春节/国庆等长假），避免无意义网络补数
-            market_dates = self._read_market_trade_dates(start_date, end_date)
-            if market_dates:
-                real_missing = [
-                    (a, b) for a, b in missing
-                    if any(d in market_dates for d in pd.date_range(a, b))
-                ]
-                skipped = len(missing) - len(real_missing)
-                if skipped:
-                    logger.info("忽略 %d 个非交易日缺口（法定长假等）: %s",
-                                skipped, symbol)
-                missing = real_missing
+            # 1) 忽略周末/指定节假日窗口构成的缺口，不再走网络补数
+            holiday_ignored = [
+                (a, b) for a, b in missing
+                if is_ignored_gap_range(a, b)
+            ]
+            if holiday_ignored:
+                logger.info("忽略 %d 个周末/节假日缺口: %s",
+                            len(holiday_ignored), symbol)
+            missing = [(a, b) for a, b in missing
+                       if (a, b) not in holiday_ignored]
+
+            # 2) 用 listed_date 跳过上市前区间
+            listed_date = self._get_listed_date(symbol)
+            if listed_date is not None:
+                listed_ts = pd.Timestamp(listed_date)
+                adjusted = []
+                for a, b in missing:
+                    if b < listed_ts:
+                        continue
+                    if a < listed_ts:
+                        a = listed_ts
+                    adjusted.append((a, b))
+                if len(adjusted) != len(missing):
+                    logger.info("跳过上市前缺口: %s (listed_date=%s)",
+                                symbol, listed_date)
+                missing = adjusted
+
+            # 3) 再用数据库实际交易日过滤其他休市缺口
+            #    （daily_kline 节假日脏数据已由清理脚本处理）
+            if missing:
+                market_dates = self._read_market_trade_dates(start_date, end_date)
+                if market_dates:
+                    real_missing = [
+                        (a, b) for a, b in missing
+                        if any(d in market_dates for d in pd.date_range(a, b))
+                    ]
+                    skipped = len(missing) - len(real_missing)
+                    if skipped:
+                        logger.info("忽略 %d 个非交易日缺口: %s",
+                                    skipped, symbol)
+                    missing = real_missing
 
         if not missing:
             logger.info("数据库原始K线完整，无需网络补齐: %s (%d 条)", symbol, len(df_db))

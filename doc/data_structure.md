@@ -587,7 +587,7 @@ WHERE s.trade_date = (
 ## 八、存储特点
 
 ### 8.1 数据库持久化（主数据仓库）
-- 数据库配置位于 `pyproject.toml` 的 `[tool.stock-quant.database]`，DDL 位于 `data/stock_quant.sql`，存量库升级脚本位于 `data/migrations/`。
+- 数据库配置位于 `squant.toml` 的 `[tool.stock-quant.database]`，DDL 位于 `data/stock_quant.sql`，存量库升级脚本位于 `data/migrations/`。
 - 资产统一使用 `(code, exchange, asset_type)` 标识，`asset_type` 区分 `stock / index / etf / fund / bond`。
 - `daily_kline`、`daily_indicators` 等行情表均带 `exchange` 与 `asset_type`；指标表额外带 `adjust_type`。
 - `daily_kline` 固定只写原始价（`adjust_type='raw'`）；读取后由 `_apply_in_memory_adjust` 在内存中做前复权。
@@ -613,5 +613,6 @@ WHERE s.trade_date = (
 ### 8.4 输入文件
 | 文件 | 格式 | 用途 |
 |------|------|------|
-| `pyproject.toml` | TOML | 软件配置：版本、阈值、服务、Webhook、数据库、综合权重 |
-| `input/favs.json` | JSON 数组 | 自选股(回退) |
+| `squant.toml` | TOML | 软件配置：版本、阈值、服务、Webhook、数据库、综合权重 |
+| `input/pool.txt` | 文本 | 默认股票池（`代码 名称`，`-s/-sf` 缺省时使用） |
+| `input/favs.json` | JSON 数组 | 自选股(兼容保留) |

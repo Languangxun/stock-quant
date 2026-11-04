@@ -40,9 +40,9 @@ class RSIStrategy(Strategy):
         Args:
             period (int): RSI 计算周期，默认 14
             oversold (float): 超卖阈值，RSI 低于此值视为超卖（未传参时读取
-                pyproject.toml 的 MIN_RSI_THRESHOLD，配置默认 25）
+                squant.toml 的 MIN_RSI_THRESHOLD，配置默认 25）
             overbought (float): 超买阈值，RSI 高于此值视为超买（未传参时读取
-                pyproject.toml 的 MAX_RSI_THRESHOLD，配置默认 85）
+                squant.toml 的 MAX_RSI_THRESHOLD，配置默认 85）
             name (str): 策略名称
         """
         super().__init__(name=name)

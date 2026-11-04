@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""统一阈值配置（pyproject.toml 的 [tool.stock-quant.thresholds] 节）
+"""统一阈值配置（squant.toml 的 [tool.stock-quant.thresholds] 节）
 
 配置项（均为数值）：
     MAX_DRAWDWON_THRESHOLD  最大回撤止损阈值（百分比，15 表示 15%）

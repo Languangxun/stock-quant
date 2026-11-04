@@ -1,7 +1,7 @@
 """
 数据库连接工具模块
 
-提供 MySQL 连接管理和 CRUD 操作, 支持从 pyproject.toml 读取连接配置。
+提供 MySQL 连接管理和 CRUD 操作, 支持从 squant.toml 读取连接配置。
 """
 
 import os
@@ -22,6 +22,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _DB_CONFIG = None
+_DB_AVAILABLE = None
 
 # 数据库缓存模式：
 #   0 = 忽略数据库缓存（纯网络，不读不写）
@@ -41,6 +42,58 @@ def set_db_mode(mode: int):
 def get_db_mode() -> int:
     """获取数据库缓存模式"""
     return _DB_MODE
+
+
+def set_db_available(available: bool):
+    """设置本次进程的数据库可用状态。"""
+    global _DB_AVAILABLE
+    _DB_AVAILABLE = bool(available)
+
+
+def is_db_available():
+    """返回数据库可用状态：True/False/None（尚未检查）。"""
+    return _DB_AVAILABLE
+
+
+def check_db_connection(timeout: int = 3) -> bool:
+    """启动时检查数据库连接，并缓存可用状态。
+
+    连接失败时设置 _DB_AVAILABLE=False，后续所有数据库读写直接跳过，
+    数据获取流程自动改走网络。
+    """
+    global _DB_AVAILABLE
+    cfg = _load_db_config()
+    if not cfg:
+        _DB_AVAILABLE = False
+        logger.warning("未配置数据库，后续数据将从网络获取")
+        return False
+    try:
+        import pymysql
+    except ImportError:
+        _DB_AVAILABLE = False
+        logger.warning("pymysql 未安装，后续数据将从网络获取")
+        return False
+
+    conn = None
+    try:
+        conn = pymysql.connect(
+            **cfg, connect_timeout=timeout,
+            read_timeout=max(5, timeout), write_timeout=max(5, timeout))
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        _DB_AVAILABLE = True
+        logger.info("数据库连接正常")
+        return True
+    except Exception as e:
+        _DB_AVAILABLE = False
+        logger.warning("数据库连接失败，后续数据将从网络获取: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # 写操作锁：多线程/多进程并发 REPLACE INTO 时 InnoDB 容易死锁（1213）。
@@ -154,7 +207,7 @@ def normalize_instrument(code: str, exchange: str = None,
 
 
 def _load_db_config():
-    """从 pyproject.toml 的 [tool.stock-quant.database] 加载数据库配置"""
+    """从 squant.toml 的 [tool.stock-quant.database] 加载数据库配置"""
     global _DB_CONFIG
     if _DB_CONFIG is not None:
         return _DB_CONFIG
@@ -177,16 +230,21 @@ def _load_db_config():
 @contextmanager
 def _open_connection():
     """建立数据库连接（不含模式判断）"""
+    if _DB_AVAILABLE is False:
+        yield None
+        return
     cfg = _load_db_config()
     if not cfg:
         # 未配置数据库：静默跳过（数据库为可选基础设施，不应报错）
-        logger.debug("未配置数据库配置(pyproject.toml)，跳过数据库读写")
+        globals()['_DB_AVAILABLE'] = False
+        logger.debug("未配置数据库配置(squant.toml)，跳过数据库读写")
         yield None
         return
 
     try:
         import pymysql
     except ImportError:
+        globals()['_DB_AVAILABLE'] = False
         logger.warning("pymysql 未安装, 将跳过数据库读写")
         yield None
         return
@@ -195,10 +253,12 @@ def _open_connection():
     try:
         conn = pymysql.connect(**cfg, connect_timeout=5, read_timeout=10, write_timeout=10)
     except Exception as e:
-        logger.warning("数据库连接失败: %s", e)
+        globals()['_DB_AVAILABLE'] = False
+        logger.warning("数据库连接失败，后续数据将从网络获取: %s", e)
         yield None
         return
 
+    globals()['_DB_AVAILABLE'] = True
     try:
         yield conn
     finally:
@@ -305,6 +365,33 @@ def fetch_market_trade_dates(start_date: str, end_date: str,
             return [r[0] for r in cursor.fetchall()]
     except Exception as e:
         logger.warning("读取市场交易日失败: %s", e)
+        return []
+
+
+def fetch_market_breadth_adl(start_date: str, end_date: str,
+                             universe_code: str = 'ALL_A',
+                             force: bool = True) -> list:
+    """读取市场广度累计线 ADL（按交易日期）。
+
+    Returns:
+        list[tuple[date, int]]: [(trade_date, adl), ...]
+    """
+    try:
+        with get_connection(force=force) as conn:
+            if conn is None:
+                return []
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT trade_date, adl
+                FROM market_breadth
+                WHERE universe_code = %s
+                  AND trade_date >= %s AND trade_date <= %s
+                  AND adl IS NOT NULL
+                ORDER BY trade_date
+            """, (universe_code, start_date, end_date))
+            return cursor.fetchall()
+    except Exception as e:
+        logger.warning("读取市场广度ADL失败: %s", e)
         return []
 
 
@@ -778,16 +865,17 @@ def store_insider_trades(code: str, df, exchange: str = None,
 
 
 def fetch_stock_info(code: str, exchange: str = None,
-                     asset_type: str = 'stock') -> Optional[dict]:
-    """从 stocks 表读取资产基本信息"""
+                     asset_type: str = 'stock', force: bool = False) -> Optional[dict]:
+    """从 stocks 表读取资产基本信息（含上市日期）"""
     code, exchange, asset_type = normalize_instrument(code, exchange, asset_type)
     try:
-        with get_connection() as conn:
+        with get_connection(force=force) as conn:
             if conn is None:
                 return None
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT code, exchange, asset_type, name, market, stock_type, is_etf
+                """SELECT code, exchange, asset_type, name, market, stock_type,
+                          is_etf, listed_date
                    FROM stocks
                    WHERE code = %s AND exchange = %s AND asset_type = %s""",
                 (code, exchange, asset_type)
@@ -797,7 +885,8 @@ def fetch_stock_info(code: str, exchange: str = None,
                 return {
                     'code': row[0], 'exchange': row[1], 'asset_type': row[2],
                     'name': row[3], 'market': row[4],
-                    'stock_type': row[5], 'is_etf': row[6]
+                    'stock_type': row[5], 'is_etf': row[6],
+                    'listed_date': row[7]
                 }
             return None
     except Exception as e:

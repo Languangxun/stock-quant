@@ -32,6 +32,18 @@ def _synchronized_plot(func):
             return func(self, *args, **kwargs)
     return wrapper
 
+
+@functools.lru_cache(maxsize=64)
+def _cached_breadth_adl(start_date, end_date, universe_code='ALL_A'):
+    """进程内缓存 market_breadth 的 ADL 查询结果。"""
+    try:
+        from core.db import fetch_market_breadth_adl
+        rows = fetch_market_breadth_adl(start_date, end_date,
+                                        universe_code=universe_code, force=True)
+    except Exception:
+        return ()
+    return tuple(rows)
+
 # ============================================================================
 # 中文字体设置
 # ============================================================================
@@ -143,6 +155,20 @@ class ChartGenerator:
                 plots.append(mpf.make_addplot(df[col], panel=panel, color=color,
                                               width=1.0, secondary_y=False))
         return plots
+
+    def _adl_series(self, df):
+        """从 market_breadth 读取 ADL 累计线，并对齐到 df 的日期索引。"""
+        if df is None or len(df) == 0:
+            return None
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            idx = pd.DatetimeIndex(pd.to_datetime(idx))
+        rows = _cached_breadth_adl(idx.min().strftime('%Y-%m-%d'),
+                                   idx.max().strftime('%Y-%m-%d'))
+        if not rows:
+            return None
+        adl = pd.Series({pd.Timestamp(d): float(v) for d, v in rows}).sort_index()
+        return adl.reindex(idx)
 
     @_synchronized_plot
     def plot_kline_with_indicators(self, df, title='K线图与技术指标', save_path=None):
@@ -570,6 +596,7 @@ class ChartGenerator:
         'ma1030': 'ma',
         'ema1030': 'ema',
         'macd': 'macd',
+        'macd1': 'macd',
         'rsi': 'rsi',
         'boll': 'boll',
         'kdj': 'kdj',
@@ -949,18 +976,29 @@ class ChartGenerator:
 
         # 买卖点标注已移至指标子图（由 _strategy_indicator_addplots 处理），K线主图不再标注
 
-        # 指标子图 (panel 2，panel 1 为成交量)
-        indicator_panel = 2
+        # ADL 子图 (panel 2，panel 1 为成交量)
+        next_panel = 2
+        adl_series = self._adl_series(df)
+        if adl_series is not None and adl_series.notna().any():
+            add_plots.append(mpf.make_addplot(adl_series, panel=next_panel, color='#16a085',
+                                              width=1.1, ylabel='ADL', label='ADL',
+                                              secondary_y=False))
+            panel_ratios.append(FACTOR_PANEL_RATIO)
+            next_panel += 1
+
+        # 指标子图
+        indicator_panel = next_panel
         ind_plots = self._strategy_indicator_addplots(df, strategy_key, indicator_panel, signals=signals)
         has_indicator = bool(ind_plots)
         if has_indicator:
             add_plots.extend(ind_plots)
             panel_ratios.append(FACTOR_PANEL_RATIO)
+            next_panel += 1
 
         # 权益曲线子图（最后）
         eq_series = None
         if equity_curve is not None:
-            equity_panel = 3 if has_indicator else 2
+            equity_panel = next_panel
             eq_series = equity_curve.reindex(df.index)
             add_plots.append(mpf.make_addplot(eq_series, panel=equity_panel, color=COLOR_BLUE, width=1.1, ylabel='权益', secondary_y=False))
             panel_ratios.append(1.5)
@@ -1108,9 +1146,20 @@ class ChartGenerator:
         # K线主图叠加 MA10/MA20/MA60/MA120
         add_plots.extend(self._ma_price_overlays(df, panel=0))
 
+        # ADL 子图 (panel 2，panel 1 为成交量)
+        next_panel = 2
+        adl_panel = None
+        adl_series = self._adl_series(df)
+        if adl_series is not None and adl_series.notna().any():
+            add_plots.append(mpf.make_addplot(adl_series, panel=next_panel, color='#16a085',
+                                              width=1.1, ylabel='ADL', label='ADL',
+                                              secondary_y=False))
+            panel_ratios.append(FACTOR_PANEL_RATIO)
+            adl_panel = next_panel
+            next_panel += 1
+
         # 各策略指标子图（含各自买卖点标注）
         indicator_panels = []  # (panel, strategy_key)
-        next_panel = 2
         for sd in strategies_data:
             signals = sd.get('signals')
             if signals is not None and len(signals) > 0:
@@ -1151,9 +1200,10 @@ class ChartGenerator:
             rc={'font.sans-serif': [FP_REGULAR.get_name(), 'DejaVu Sans'], 'axes.unicode_minus': False}
         )
 
+        extra_panels = len(indicator_panels) + (1 if adl_panel is not None else 0)
         fig, axes = mpf.plot(
             df, type='candle', style=s, volume=True, addplot=add_plots,
-            panel_ratios=tuple(panel_ratios), figsize=(16, 6 + FACTOR_PANEL_RATIO * len(indicator_panels)),
+            panel_ratios=tuple(panel_ratios), figsize=(16, 6 + FACTOR_PANEL_RATIO * extra_panels),
             returnfig=True, warn_too_much_data=len(df) + 1,
             datetime_format='%Y-%m', xrotation=0
         )
@@ -1177,6 +1227,12 @@ class ChartGenerator:
             ind_ax = axes[panel * 2]
             if ind_ax.get_legend() is not None:
                 ind_ax.legend(loc='upper left', fontsize=8, framealpha=0.7, prop=FP_REGULAR)
+
+        # ADL 子图图例
+        if adl_panel is not None:
+            adl_ax = axes[adl_panel * 2]
+            if adl_ax.get_legend() is not None:
+                adl_ax.legend(loc='upper left', fontsize=8, framealpha=0.7, prop=FP_REGULAR)
 
         # 权益子图图例
         if has_equity:
@@ -1368,6 +1424,7 @@ class ChartGenerator:
             摆动子图：CCI + WR
             波动子图：ATR14 + HV20
             OBV 子图
+            ADL 子图
             动量子图：MOM60
 
         Parameters
@@ -1491,6 +1548,13 @@ class ChartGenerator:
         if _has('OBV'):
             p, yl = _new_panel('OBV')
             _line('OBV', p, '#1abc9c', ylabel=yl)
+
+        # ---- ADL 子图（读取市场广度累计线）----
+        adl_series = self._adl_series(df)
+        if adl_series is not None and adl_series.notna().any():
+            p, yl = _new_panel('ADL')
+            add_plots.append(mpf.make_addplot(adl_series, panel=p, color='#16a085',
+                                              width=1.1, ylabel=yl, secondary_y=False))
 
         # ---- 动量子图（MOM60）----
         if _has('MOM60'):

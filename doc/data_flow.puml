@@ -1,0 +1,138 @@
+@startuml
+title stock-quant 数据流转与核心存储
+
+skinparam shadowing false
+skinparam defaultFontName "Noto Sans CJK SC"
+skinparam componentStyle rectangle
+left to right direction
+
+actor "用户 / 定时任务" as User
+rectangle "CLI 入口\nmain.py / squant" as CLI
+rectangle "输入解析\n-s / -sf / 默认 input/pool.txt" as Input
+rectangle "名称解析\nSina suggest / hq" as Name
+
+cloud "外部数据源" {
+  [新浪\nK线 / 实时 / 复权因子] as Sina
+  [东方财富] as Eastmoney
+  [Baostock] as Baostock
+  [AkShare\n长历史 / 估值 / 财务] as AkShare
+  [yfinance\n美股] as YFinance
+}
+
+package "core.data_fetcher" {
+  component "源测速\nrun_source_speed_test" as Speed
+  component "DataFetcher\nget_stock_data" as Fetcher
+  component "自动源链\n_source_fallback_chain" as Chain
+  component "缺口检测\n_find_missing_ranges" as Gap
+  component "内存复权\n_apply_adjust_factor" as Adjust
+  component "实时行情合并\n_apply_realtime_to_df" as Realtime
+}
+
+database "MySQL: stock_quant" as DB {
+  folder "资产 / 行情" {
+    entity "stocks\nPK(code, exchange, asset_type)" as Stocks
+    entity "daily_kline\n只存 raw OHLCV" as DailyKline
+    entity "adjust_events\n除权除息事件" as AdjustEvents
+  }
+  folder "衍生 / 广度" {
+    entity "daily_indicators\nqfq 指标" as DailyIndicators
+    entity "market_breadth\nPK(universe_code, trade_date)" as MarketBreadth
+    entity "broad_index_daily\n指数专用物化表" as BroadIndex
+  }
+  folder "基本面 / 筹码" {
+    entity "valuation_history" as Valuation
+    entity "financial_reports" as Financials
+    entity "shareholder_history" as Shareholder
+    entity "insider_trades" as Insider
+  }
+  folder "结果 / 队列" {
+    entity "strategy_signals\n预留" as Signals
+    entity "backtest_results\n预留" as BacktestResults
+    entity "market_breadth_dirty\n脏日期队列" as BreadthDirty
+  }
+}
+
+package "指标与信号" {
+  component "add_all_indicators\nMA/EMA/MACD/RSI/BOLL/KDJ/..." as Indicators
+  component "Strategy.generate_signals" as Strategy
+  component "信号过滤\n涨幅/SAR/指数/PREV" as Filters
+}
+
+package "回测与风险" {
+  component "BacktestEngine\n佣金/滑点/持仓模式" as Backtest
+  component "risk_report\nVaR/CVaR/回撤/夏普" as Risk
+}
+
+package "输出" {
+  component "matplotlib / mplfinance\nK线 / 权益 / ADL" as Charts
+  component "HTML 报告" as Html
+  component "控制台表格 / CSV" as Console
+  component "钉钉通知" as Notify
+}
+
+User --> CLI
+CLI --> Input
+Input --> Name
+CLI --> Fetcher
+Speed --> Chain
+Chain --> Fetcher
+
+Sina --> Fetcher
+Eastmoney --> Fetcher
+Baostock --> Fetcher
+AkShare --> Fetcher
+YFinance --> Fetcher
+
+Fetcher <--> DailyKline : 历史请求：读 raw / 缺口回写
+Fetcher --> AdjustEvents : 分红送配
+Fetcher --> Stocks : 资产信息
+Fetcher --> Gap
+Fetcher --> Adjust : 复权因子
+Adjust --> Indicators : 复权后 OHLCV
+Fetcher --> Realtime
+Realtime --> Indicators
+
+Indicators --> Strategy
+Valuation --> Strategy
+Financials --> Strategy
+Shareholder --> Strategy
+Insider --> Strategy
+Strategy --> Filters
+Filters --> Backtest
+Backtest --> Risk
+Risk --> Charts
+Risk --> Html
+Risk --> Console
+Risk --> Notify
+
+DailyKline --> BreadthDirty : INSERT/UPDATE/DELETE 触发器
+BreadthDirty --> MarketBreadth : EVENT 每 30 秒\n每次最多 20 个日期
+MarketBreadth --> Charts : ADL（ALL_A）对齐 K 线日期
+
+Backtest --> BacktestResults : 可选持久化
+Strategy --> Signals : 可选持久化
+Indicators --> DailyIndicators : 可选写入
+
+note right of DailyKline
+  唯一键：
+  (code, exchange, asset_type, trade_date, adjust_type)
+  主流程固定 adjust_type='raw'
+  qfq/hfq 只在内存中计算
+end note
+
+note right of Fetcher
+  结束日 = 今天：
+  昨天及以前读数据库（缺口补齐）
+  今天取实时行情/网络
+  今日数据不回写数据库
+  结束日 < 今天：
+  数据库优先 + 缺口补齐 + 回写
+end note
+
+note right of MarketBreadth
+  只统计 asset_type='stock'
+  且 adjust_type='raw'
+  ADL = 上一交易日 ADL + (上涨家数 - 下跌家数)
+end note
+
+@enduml

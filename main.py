@@ -23,17 +23,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 导入核心模块
 from core.data_fetcher import DataFetcher, set_primary_source
-from core.indicators import add_all_indicators, classify_trend, calc_sar, calc_rsi
+from core.indicators import add_all_indicators, classify_trend, calc_sar, calc_rsi, calc_bollinger
 from core.backtest import BacktestEngine
 from core.risk import risk_report
 from core.strategy import Strategy
 from core.thresholds import get_threshold, get_sar_check, get_index_check_mode
-from core.config import load_config
+from core.config import load_config, app_root
+from core.db import check_db_connection
 from core.constants import TRADING_DAYS_PER_YEAR
 from _version import __version__
 from strategies.ma_cross import MACrossStrategy
 from strategies.ema_cross import EMACrossStrategy
 from strategies.macd_strategy import MACDStrategy
+from strategies.macd1_strategy import MACD1Strategy
 from strategies.bollinger_strategy import BollingerStrategy
 from strategies.kdj_strategy import KDJStrategy
 from strategies.quality_value_factor import QualityValueFactorStrategy
@@ -46,6 +48,29 @@ from strategies.sg2_strategy import SG2Strategy
 from strategies.sg3_strategy import SG3Strategy
 from strategies.sar_strategy import SARStrategy
 from visualization.charts import ChartGenerator
+
+
+def _silence_py_mini_racer_shutdown_error():
+    """屏蔽 py_mini_racer 在解释器退出阶段 __del__ 的噪声异常。"""
+    try:
+        from py_mini_racer.py_mini_racer import MiniRacer
+    except Exception:
+        return
+    if getattr(MiniRacer, '_squant_safe_del', False):
+        return
+    original_del = MiniRacer.__del__
+
+    def _safe_del(self):
+        try:
+            original_del(self)
+        except Exception:
+            pass
+
+    MiniRacer.__del__ = _safe_del
+    MiniRacer._squant_safe_del = True
+
+
+_silence_py_mini_racer_shutdown_error()
 
 # 导入表格格式化库
 try:
@@ -65,6 +90,7 @@ STRATEGY_MAP = {
     'ma1030': ('MA1030', MACrossStrategy),
     'ema1030': ('EMA1030', EMACrossStrategy),
     'macd': ('MACD', MACDStrategy),
+    'macd1': ('MACD1', MACD1Strategy),
     'boll': ('BOLL', BollingerStrategy),
     'kdj': ('KDJ', KDJStrategy),
     'sar': ('SAR', SARStrategy),
@@ -81,7 +107,7 @@ INDEX_STRATEGY_MAP = {
     'breadth': ('涨跌比确认策略', BreadthConfirmationStrategy),
 }
 
-ALL_STRATEGIES = ['ma1030', 'ema1030', 'macd', 'boll', 'kdj', 'sar', 'ma310', 'ma520', 'ema520', 'hold']
+ALL_STRATEGIES = ['ma1030', 'ema1030', 'macd', 'macd1', 'boll', 'kdj', 'sar', 'ma310', 'ma520', 'ema520', 'hold']
 # -g all 使用的策略集合（排除 ma1030 / ma310 / ma520，仍可用 -g 单独指定）
 ALL_SELECTION = [k for k in ALL_STRATEGIES if k not in ('ma1030', 'ma310', 'ma520')]
 ALL_INDEX_STRATEGIES = ['momentum', 'volatility', 'breadth']
@@ -91,6 +117,7 @@ _SCAN_SHORT_NAMES = {
     'ma1030': 'MA1030',
     'ema1030': 'EMA1030',
     'macd': 'MACD',
+    'macd1': 'MACD1',
     'boll': 'BOLL',
     'kdj': 'KDJ',
     'sar': 'SAR',
@@ -106,6 +133,7 @@ ETF_STRATEGY_MAP = {
     'ma1030': ('ETF均线', lambda: MACrossStrategy(fast_period=10, slow_period=40, name='ETF MACross')),
     'ema1030': ('ETF EMA', lambda: EMACrossStrategy(fast_period=10, slow_period=40, name='ETF EMACross')),
     'macd': ('ETF MACD', lambda: MACDStrategy(fast=16, slow=32, signal=12, name='ETF MACD')),
+    'macd1': ('ETF MACD1', lambda: MACD1Strategy(name='ETF MACD1')),
     'boll': ('ETF BOLL', lambda: BollingerStrategy(period=20, std=2.5, name='ETF Bollinger')),
     'kdj': ('ETF KDJ', lambda: KDJStrategy(n=9, m1=3, m2=3, oversold=20, overbought=80, name='ETF KDJ')),
     'sar': ('ETF SAR', lambda: SARStrategy(name='ETF SAR')),
@@ -115,7 +143,7 @@ ETF_STRATEGY_MAP = {
     'quality_value': ('ETF多因子', lambda: QualityValueFactorStrategy(stock_type='auto', name='ETF QualityValue')),
     'hold': ('ETF持有', lambda: HoldStrategy(name='ETF Hold')),
 }
-ALL_ETF_STRATEGIES = ['ma1030', 'ema1030', 'macd', 'boll', 'kdj', 'sar', 'ma310', 'ma520', 'ema520', 'quality_value', 'hold']
+ALL_ETF_STRATEGIES = ['ma1030', 'ema1030', 'macd', 'macd1', 'boll', 'kdj', 'sar', 'ma310', 'ma520', 'ema520', 'quality_value', 'hold']
 ALL_ETF_SELECTION = [k for k in ALL_ETF_STRATEGIES if k not in ('ma1030', 'ma310', 'ma520')]
 
 # 策略 key 到类的映射
@@ -123,6 +151,7 @@ _STRATEGY_CLASS_MAP = {
     'ma1030': MACrossStrategy,
     'ema1030': EMACrossStrategy,
     'macd': MACDStrategy,
+    'macd1': MACD1Strategy,
     'boll': BollingerStrategy,
     'kdj': KDJStrategy,
     'sar': SARStrategy,
@@ -148,7 +177,7 @@ _quant_config = None
 
 
 def _load_quant_config():
-    """加载 pyproject.toml 的 [tool.stock-quant] 配置，失败时返回空字典"""
+    """加载 squant.toml 的 [tool.stock-quant] 配置，失败时返回空字典"""
     global _quant_config
     if _quant_config is None:
         _quant_config = load_config()
@@ -175,6 +204,23 @@ def _set_seqnum(v):
         _SEQNUM = max(0, int(v))
     except (TypeError, ValueError):
         _SEQNUM = 0
+
+
+# 最大持股天数：自建仓买入起，持仓超过 N 个交易日、收盘价低于 BOLL 中线且
+# 持仓期最大回撤 > 10% 时卖出；None 不限制
+_MAX_HOLD_DAYS = None
+_MAX_HOLD_DRAWDOWN = 0.10
+
+
+def _set_max_hold_days(v):
+    global _MAX_HOLD_DAYS
+    if v is None:
+        _MAX_HOLD_DAYS = None
+        return
+    try:
+        _MAX_HOLD_DAYS = max(1, int(v))
+    except (TypeError, ValueError):
+        _MAX_HOLD_DAYS = None
 
 
 def _signal_sequence(signals):
@@ -288,13 +334,84 @@ def _filter_buy_on_sar(signals, df, sar_ok=None):
     return signals
 
 
+def _apply_max_hold_days(signals, max_days, df=None):
+    """持股超过 max_days、收盘价低于 BOLL 中线且回撤 > 10% 时卖出。
+
+    以建仓后的首次买入为计时起点，持仓期间重复买入不重新计时；
+    最大回撤按持仓期内最高收盘价到当前收盘价计算。
+    max_days 为 None/0 时不限制。
+    """
+    if signals is None or len(signals) == 0 or not max_days:
+        return signals
+    try:
+        max_days = int(max_days)
+    except (TypeError, ValueError):
+        return signals
+    if max_days <= 0:
+        return signals
+
+    close = None
+    below_mid = None
+    if df is not None and 'close' in df.columns:
+        close = pd.to_numeric(df['close'], errors='coerce').reindex(signals.index)
+        try:
+            mid = df['BOLL_MIDDLE'] if 'BOLL_MIDDLE' in df.columns else calc_bollinger(df)['MIDDLE']
+            below_mid = (df['close'] < mid).reindex(signals.index).fillna(False)
+        except Exception:
+            below_mid = None
+
+    out = signals.copy()
+    entry_pos = None
+    peak = None
+    for i in range(len(out)):
+        val = out.iloc[i]
+        c = close.iloc[i] if close is not None else None
+        if pd.isna(val):
+            continue
+
+        if entry_pos is not None and c is not None and pd.notna(c):
+            if peak is None or c > peak:
+                peak = float(c)
+
+        if val < 0:
+            entry_pos = None
+            peak = None
+        elif val > 0:
+            if entry_pos is None:
+                entry_pos = i
+                peak = float(c) if c is not None and pd.notna(c) else None
+            else:
+                drawdown = ((peak - c) / peak
+                            if peak and peak > 0 and c is not None
+                            and pd.notna(c) else 0.0)
+                if (i - entry_pos > max_days and below_mid is not None
+                        and bool(below_mid.iloc[i])
+                        and drawdown > _MAX_HOLD_DRAWDOWN):
+                    out.iloc[i] = -1.0
+                    entry_pos = None
+                    peak = None
+        elif entry_pos is not None:
+            drawdown = ((peak - c) / peak
+                        if peak and peak > 0 and c is not None
+                        and pd.notna(c) else 0.0)
+            if (i - entry_pos > max_days and below_mid is not None
+                    and bool(below_mid.iloc[i])
+                    and drawdown > _MAX_HOLD_DRAWDOWN):
+                out.iloc[i] = -1.0
+                entry_pos = None
+                peak = None
+    out.attrs = dict(getattr(signals, 'attrs', {}))
+    return out
+
+
 def _generate_effective_signals(strategy, df):
     """生成最终交易信号
 
     - BOLL：在策略内部同步 -sn、涨幅过滤、SAR_CHECK、INDEX_CHECK 与回撤止损；
     - MACD：内部同步涨幅过滤、SAR_CHECK、INDEX_CHECK 与回撤止损，忽略 -sn；
     - SG1/SG2/SG3：内部同步涨幅过滤、SAR_CHECK、INDEX_CHECK 与回撤止损，忽略 -sn；
-    - 其余策略：外部应用涨幅过滤、SAR_CHECK 与 INDEX_CHECK，忽略 -sn。
+    - 其余策略：外部应用涨幅过滤、SAR_CHECK 与 INDEX_CHECK，忽略 -sn；
+    - 所有策略最后统一应用最大持股天数限制（超过 N 天、跌破 BOLL 中线且回撤 >10% 才卖出）。
     """
     sar_ok = None
     if get_sar_check() and not getattr(strategy, 'exclude_sar_check', False):
@@ -305,15 +422,16 @@ def _generate_effective_signals(strategy, df):
         signals = strategy.generate_signals(
             df, seqnum=seqnum, max_buy_gain=_MAX_BUY_DAY_GAIN, sar_ok=sar_ok,
             index_ok=index_ok)
-        return _mask_signal_warmup(signals)
+        return _apply_max_hold_days(_mask_signal_warmup(signals), _MAX_HOLD_DAYS, df)
     signals = _filter_buy_on_big_gain(
         _mask_signal_warmup(strategy.generate_signals(df)), df)
     signals = _filter_buy_on_sar(signals, df, sar_ok=sar_ok)
-    return _filter_buy_on_index(signals, df, index_ok=index_ok)
+    signals = _filter_buy_on_index(signals, df, index_ok=index_ok)
+    return _apply_max_hold_days(signals, _MAX_HOLD_DAYS, df)
 
 
 def _get_position_style():
-    """从 pyproject.toml 读取回测持仓模式（position_style），默认 'full'
+    """从 squant.toml 读取回测持仓模式（position_style），默认 'full'
 
     合法值：'full'（全仓）/ 'fraction'（按信号比例），非法时回退默认并告警。
     """
@@ -427,6 +545,7 @@ def _run_single_analysis(df, strategy_key, capital, chart_gen, prefix='', strate
 
 def _run_signals_backtest(df, signals, capital, strategy_key, strategy_name, enhance=0):
     """用已有信号序列直接回测并返回结果（用于 PREV 等非标准策略）"""
+    signals = _apply_max_hold_days(signals, _MAX_HOLD_DAYS, df)
     signals = _filter_buy_on_big_gain(signals, df)
     signals = _filter_buy_on_sar(signals, df)
     signals = _filter_buy_on_index(signals, df)
@@ -647,7 +766,8 @@ def _command_options_str():
 
 def _format_cmd_params(symbol, symbol_file, hot, start, end, strategy, is_index,
                        capital, output, output_file, threads, mode,
-                       filter_signal=None, chart=False, forecast=0, seqnum=0):
+                       filter_signal=None, chart=False, forecast=0, seqnum=0,
+                       max_hold_days=None):
     """构建命令选项参数摘要字符串，用于在报告中标注本次运行所用的选项"""
     parts = ['analyze']
     if symbol:
@@ -677,6 +797,8 @@ def _format_cmd_params(symbol, symbol_file, hot, start, end, strategy, is_index,
         parts.append('--forecast')
     if seqnum and int(seqnum) != 0:
         parts.append(f'-sn {seqnum}')
+    if max_hold_days:
+        parts.append(f'--maxholddays {max_hold_days}')
     return ' '.join(parts)
 
 
@@ -731,7 +853,7 @@ def _signal_reason(strategy_key, signal, enhance=0):
     if base in ('ma1030', 'ema1030'):
         ma = 'EMA' if base == 'ema1030' else 'MA'
         return f'{ma}快线上穿慢线（金叉）' if buy else f'{ma}快线下穿慢线（死叉）'
-    if base == 'macd':
+    if base in ('macd', 'macd1'):
         return 'DIF 上穿 DEA（金叉）' if buy else 'DIF 下穿 DEA（死叉）'
     if base == 'boll':
         return '跌破下轨后反弹' if buy else '触及上轨后回落或回撤止损'
@@ -915,7 +1037,7 @@ def _match_filter(filter_signal, all_signals, all_risks=None):
 
 
 def _get_webhook_config():
-    """读取钉钉机器人 Webhook 配置（pyproject.toml 的 WEBHOOK 节）"""
+    """读取钉钉机器人 Webhook 配置（squant.toml 的 WEBHOOK 节）"""
     config = _load_quant_config().get('WEBHOOK', {})
     url = config.get('URL')
     key = config.get('key', 'quant')
@@ -1385,7 +1507,7 @@ def _generate_backtest_html(symbol_label, start_date, end_date, capital, tables,
     from datetime import datetime as dt
     report_time = dt.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    # 概要备注：回测使用的阈值参数（读取 pyproject.toml 的 thresholds）
+    # 概要备注：回测使用的阈值参数（读取 squant.toml 的 thresholds）
     def _fmt_th(v):
         return 'N/A' if v is None else f'{v:g}'
 
@@ -1790,7 +1912,11 @@ def cli():
 
     提供股票技术分析、策略回测、策略对比、股票扫描等功能。
     """
-    pass
+    ctx = click.get_current_context(silent=True)
+    if ctx is not None and ctx.invoked_subcommand:
+        if not check_db_connection():
+            click.echo(click.style(
+                '  警告: 数据库连接失败，本次运行将仅从网络获取数据', fg='yellow'))
 
 
 def _resolve_symbol(input_str):
@@ -2155,15 +2281,24 @@ def _seqnum_option(f):
         help='买入信号序号（仅 BOLL 生效）：仅保留自上次卖出后第N次买入信号（0=不过滤，默认0；1=首次）；其它策略忽略该选项')(f)
 
 
+def _maxhold_option(f):
+    """通用 --maxholddays 选项：最大持股天数"""
+    return click.option(
+        '--maxholddays', 'max_hold_days', default=None,
+        type=click.IntRange(1, 100000),
+        help='最大持股天数：持有超过N个交易日、收盘价低于BOLL中线且持仓回撤>10%时卖出（默认不限制）')(f)
+
+
 @cli.command('analyze')
 @_src_option
 @_seqnum_option
+@_maxhold_option
 @click.option('--symbol', '-s', default=None, help='股票代码或名称，可多个，以空格分隔（如 "000725 京东方A 000021"）')
 @click.option('--symbol-file', '-sf', default=None, help='从指定文件读取股票代码（空格/逗号/换行分隔），仅处理有效 6 位代码并忽略名称，与 -s 同时使用时合并')
 @click.option('--hot', '-h', default=None, type=int, help='获取热门股票数量（按HotScore热度分排序，存在时忽略 -s 和 -sf）')
 @click.option('--start', '-st', default=None, help='开始日期（默认180天前），格式: YYYYMMDD')
 @click.option('--end', '-e', default=None, help='结束日期（默认今天），格式: YYYYMMDD')
-@click.option('--strategy', '-g', default='boll,macd',     help='策略选择 [ma1030|ema1030|macd|boll|kdj|sar|ma310|ma520|ema520|quality_value|hold|all]，多个用逗号分隔（默认boll,macd）')
+@click.option('--strategy', '-g', default='boll,macd',     help='策略选择 [ma1030|ema1030|macd|macd1|boll|kdj|sar|ma310|ma520|ema520|quality_value|hold|all]，多个用逗号分隔（默认boll,macd）')
 @click.option('--index', '-i', 'is_index', is_flag=True, default=False, help='使用指数专属策略模式（动量分层/波动率择时/涨跌比确认）')
 @click.option('--capital', '-c', default=100, type=float, help='初始资金（单位：万元，默认100万元）')
 @click.option('--output', '-o', default='./output', help='图表输出目录（默认./output）')
@@ -2173,9 +2308,9 @@ def _seqnum_option(f):
 @click.option('--filter', '-f', 'filter_signal', default=None, type=click.Choice(['b', 's', 'w']), help='信号过滤，仅输出符合指定信号的股票报告 [b=买入|s=卖出|w=观望]')
 @click.option('--chart', is_flag=True, default=False, help='生成所有股票的K线图等图形并嵌入报告（默认仅生成至少有一个策略信号非观望的股票的图表）')
 @click.option('--forecast', is_flag=True, default=False, help='预测次日触发买卖信号的收盘价阈值（不指定则不预测）')
-@click.option('--notify', is_flag=True, default=False, help='对最新信号非观望的股票通过钉钉机器人发送通知（读取 pyproject.toml 的 WEBHOOK 配置）')
+@click.option('--notify', is_flag=True, default=False, help='对最新信号非观望的股票通过钉钉机器人发送通知（读取 squant.toml 的 WEBHOOK 配置）')
 @click.option('--plan-time', default=None, help='定时执行：到指定时间(hhmm，如 0900=09:00)才开始运行，当日已过则顺延到次日')
-def analyze_cmd(symbol, symbol_file, hot, start, end, strategy, is_index, capital, output, output_file, threads, mode, filter_signal, chart, forecast, notify, plan_time, src, seqnum):
+def analyze_cmd(symbol, symbol_file, hot, start, end, strategy, is_index, capital, output, output_file, threads, mode, filter_signal, chart, forecast, notify, plan_time, src, seqnum, max_hold_days):
     """量化分析：重点输出结束日当天的买卖信号
 
     流程：获取数据 -> 计算指标 -> 运行策略 -> 回测 -> 风险分析 -> 生成图表 -> 打印报告
@@ -2183,7 +2318,7 @@ def analyze_cmd(symbol, symbol_file, hot, start, end, strategy, is_index, capita
     使用 --index/-i 参数可切换到指数专属策略模式，适用于分析大盘指数。
     -s 支持多个股票代码或名称，以空格分隔；报告文件名格式为 anlyze_<file>_<strategy>_<mmddHHMM>.html。
     -s 和 -sf 可同时使用，股票列表会自动合并去重。
-    都不指定时从 input/favs.txt 读取自选股。
+    都不指定时默认采用 -sf input/pool.txt。
     使用 -h 指定数量时，忽略 -s/-sf，从网络获取最热门股票。
     缺少 -st 时默认分析周期 180 天，缺少 -e 时默认今天。
     """
@@ -2192,12 +2327,14 @@ def analyze_cmd(symbol, symbol_file, hot, start, end, strategy, is_index, capita
 
     set_primary_source(src)
     _set_seqnum(seqnum)
+    _set_max_hold_days(max_hold_days)
     capital = capital * 10000  # -c 单位为万元，内部换算为元
 
     # 命令选项参数摘要（用于在报告中标注）
     cmd_params = _format_cmd_params(symbol, symbol_file, hot, start, end, strategy,
                                     is_index, capital, output, output_file, threads, mode,
-                                    filter_signal, chart, forecast, seqnum)
+                                    filter_signal, chart, forecast, seqnum,
+                                    max_hold_days=max_hold_days)
 
     # 确定要分析的股票列表
     symbols = []
@@ -2254,18 +2391,15 @@ def analyze_cmd(symbol, symbol_file, hot, start, end, strategy, is_index, capita
                 sources.append(f'-sf ({len(file_symbols)}只)')
 
         if not symbols:
-            # 未指定 -s/-sf 时，默认采用 -sf input/favs.txt
-            favs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'input', 'favs.txt')
-            file_symbols = _read_symbols_file(favs_path)
+            # 未指定 -s/-sf 时，默认采用 -sf input/pool.txt
+            pool_path = os.path.join(app_root(), 'input', 'pool.txt')
+            file_symbols = _read_symbols_file(pool_path)
             if not file_symbols:
-                # 回退旧默认 input/favs.json
-                favs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'input', 'favs.json')
-                file_symbols = _read_symbols_file(favs_path)
-            if not file_symbols:
-                click.echo(click.style('  错误: 没有可用的自选股来源', fg='red'))
+                click.echo(click.style(
+                    '  错误: 未指定 -s/-sf，且 input/pool.txt 无有效股票代码', fg='red'))
                 return
             symbols = file_symbols
-            sources.append('favs.txt')
+            sources.append('input/pool.txt')
 
     # 去重并保持顺序
     seen = set()
@@ -2288,7 +2422,7 @@ def analyze_cmd(symbol, symbol_file, hot, start, end, strategy, is_index, capita
     elif len(symbols) == 1:
         source_tag = symbols[0]
     else:
-        source_tag = 'favs'
+        source_tag = 'pool'
 
     # 解析日期：缺少 -st 默认180天前，缺少 -e 默认今天
     start_date_str, end_date_str = _parse_dates(start, end)
@@ -2313,51 +2447,12 @@ def analyze_cmd(symbol, symbol_file, hot, start, end, strategy, is_index, capita
 
     all_stock_data = []
     if len(symbols) > 1 and threads > 1:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        from concurrent.futures import TimeoutError as _FutTimeout
-        import math
         n_workers = min(threads, len(symbols))
         click.echo(click.style(f'\n  使用 {n_workers} 个进程并行分析...', fg='blue'))
 
         tasks = [(s, start_date_str, end_date_str, strategy, is_index, capital, output, output_file, True, cmd_params, mode, filter_signal, chart, forecast) for s in symbols]
-        results = [None] * len(symbols)
-        # 单只股票超时（秒），避免个别股票因网络/数据库异常导致整体挂起
-        per_stock_timeout = 180
-        waves = max(1, math.ceil(len(symbols) / n_workers))
-        executor = ProcessPoolExecutor(max_workers=n_workers)
-        try:
-            futures = {executor.submit(_analyze_single_worker, task): i for i, task in enumerate(tasks)}
-            try:
-                for fut in as_completed(futures, timeout=per_stock_timeout * waves):
-                    idx = futures[fut]
-                    try:
-                        _, data, out = fut.result()
-                    except Exception as e:
-                        data, out = None, f'  异常: {e}'
-                    results[idx] = data
-                    if data is None:
-                        if '信号过滤' in out:
-                            click.echo(click.style(f'  [{idx+1}/{len(symbols)}] {symbols[idx]} 已跳过（信号过滤）', fg='yellow'))
-                            click.echo(out)
-                        else:
-                            click.echo(click.style(f'\n  [{idx+1}/{len(symbols)}] {symbols[idx]} 分析失败', fg='red'))
-                            if out.strip():
-                                click.echo(out)
-                    else:
-                        click.echo(click.style(f'  [{idx+1}/{len(symbols)}] {symbols[idx]} 完成', fg='cyan'))
-            except _FutTimeout:
-                stuck = [symbols[futures[f]] for f in futures if not f.done()]
-                click.echo(click.style(
-                    f'\n  警告: {len(stuck)} 只股票分析超时({per_stock_timeout}秒)被跳过: {", ".join(stuck)}', fg='yellow'))
-                for f in futures:
-                    if not f.done():
-                        f.cancel()
-                # 强制终止卡住的工作进程，避免 shutdown 挂起
-                for proc in list(executor._processes.values()):
-                    proc.terminate()
-        finally:
-            executor.shutdown(wait=True)
-        all_stock_data = [d for d in results if d is not None]
+        # 单只股票独立计时，超时只回收对应进程，不影响其它 worker
+        all_stock_data = _run_analyze_tasks(tasks, symbols, n_workers, per_stock_timeout=180)
     else:
         for idx, raw_symbol in enumerate(symbols):
             if len(symbols) > 1:
@@ -2721,6 +2816,201 @@ def _analyze_single_worker(args):
     except Exception as e:
         buf.write(f'\n  异常: {e}\n')
     return raw_symbol, data, buf.getvalue()
+
+
+def _analyze_pool_worker(worker_id, task_queue, result_queue):
+    """长期运行的 worker：从自己的任务队列取任务，完成后写回结果队列。"""
+    while True:
+        item = task_queue.get()
+        if item is None:
+            break
+        idx, task = item
+        try:
+            _, data, out = _analyze_single_worker(task)
+        except BaseException as e:
+            data, out = None, f'  异常: {e}'
+        result_queue.put((worker_id, idx, data, out))
+
+
+def _run_analyze_tasks(tasks, symbols, n_workers, per_stock_timeout=180):
+    """按 worker 独立分配任务，并对每个任务单独计时。
+
+    每个任务在分配给 worker 时开始计时；超过 per_stock_timeout 秒只终止
+    该任务对应的 worker，并启动替代进程继续处理剩余任务。
+    """
+    import multiprocessing as mp
+    import queue as _queue
+    from collections import deque
+
+    total = len(tasks)
+    if total == 0:
+        return []
+
+    methods = mp.get_all_start_methods()
+    ctx = mp.get_context('fork') if 'fork' in methods else mp.get_context()
+    result_queue = ctx.Queue()
+    workers = {}   # wid -> (process, task_queue)
+    idle = set()
+    active = {}    # wid -> (task_idx, start_monotonic)
+    done = set()
+    results = [None] * total
+
+    def _report(idx, data, out, timed_out=False):
+        if idx in done:
+            return
+        done.add(idx)
+        results[idx] = data
+        label = f'  [{idx+1}/{total}] {symbols[idx]}'
+        if data is None:
+            if '信号过滤' in (out or ''):
+                click.echo(click.style(f'{label} 已跳过（信号过滤）', fg='yellow'))
+                click.echo(out)
+            elif timed_out:
+                click.echo(click.style(f'{label} 分析超时', fg='yellow'))
+                if (out or '').strip():
+                    click.echo(out)
+            else:
+                click.echo(click.style(f'\n{label} 分析失败', fg='red'))
+                if (out or '').strip():
+                    click.echo(out)
+        else:
+            click.echo(click.style(f'{label} 完成', fg='cyan'))
+
+    def _start_worker(wid):
+        task_q = ctx.Queue()
+        proc = ctx.Process(target=_analyze_pool_worker,
+                           args=(wid, task_q, result_queue),
+                           daemon=True)
+        proc.start()
+        workers[wid] = (proc, task_q)
+        idle.add(wid)
+
+    def _kill_worker(wid):
+        idle.discard(wid)
+        item = workers.pop(wid, None)
+        if item is None:
+            return
+        proc, task_q = item
+        try:
+            task_q.close()
+        except Exception:
+            pass
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=2)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=1)
+
+    for wid in range(n_workers):
+        _start_worker(wid)
+
+    pending = deque(enumerate(tasks))
+    try:
+        while pending or active:
+            # 分发任务：每个 worker 一次只处理一个任务
+            while pending and idle:
+                wid = idle.pop()
+                idx, task = pending.popleft()
+                proc, task_q = workers[wid]
+                try:
+                    task_q.put((idx, task))
+                except Exception as e:
+                    _kill_worker(wid)
+                    _report(idx, None, f'  异常: 无法提交任务: {e}')
+                    if pending:
+                        _start_worker(wid)
+                    continue
+                active[wid] = (idx, time.monotonic())
+
+            # 收集已完成任务
+            got_result = False
+            while True:
+                try:
+                    wid, idx, data, out = result_queue.get_nowait()
+                except _queue.Empty:
+                    break
+                got_result = True
+                active.pop(wid, None)
+                if idx not in done:
+                    _report(idx, data, out)
+                proc, _ = workers.get(wid, (None, None))
+                if proc is not None and proc.is_alive() and wid not in idle:
+                    idle.add(wid)
+
+            # 独立的单任务超时检查
+            now = time.monotonic()
+            for wid, (idx, started) in list(active.items()):
+                if now - started <= per_stock_timeout:
+                    continue
+                # 超时前再确认一次结果是否刚好到达，避免误杀已完成任务
+                try:
+                    msg = result_queue.get(timeout=0.2)
+                except _queue.Empty:
+                    msg = None
+                if msg is not None:
+                    rwid, ridx, rdata, rout = msg
+                    active.pop(rwid, None)
+                    if ridx not in done:
+                        _report(ridx, rdata, rout)
+                    proc, _ = workers.get(rwid, (None, None))
+                    if proc is not None and proc.is_alive():
+                        idle.add(rwid)
+                if idx in done:
+                    continue
+
+                _kill_worker(wid)
+                active.pop(wid, None)
+                _report(idx, None,
+                        f'  超时: 分析超过 {per_stock_timeout} 秒，已回收对应进程',
+                        timed_out=True)
+                if pending:
+                    _start_worker(wid)
+
+            # worker 意外退出处理
+            for wid, (proc, task_q) in list(workers.items()):
+                if proc.is_alive():
+                    continue
+                if wid in active:
+                    idx, _ = active.pop(wid)
+                    _report(idx, None,
+                            f'  异常: 工作进程意外退出 (exitcode={proc.exitcode})')
+                idle.discard(wid)
+                try:
+                    task_q.close()
+                except Exception:
+                    pass
+                workers.pop(wid, None)
+                if pending:
+                    _start_worker(wid)
+
+            if (pending or active) and not got_result:
+                time.sleep(0.1)
+    finally:
+        for wid in list(workers):
+            try:
+                workers[wid][1].put(None)
+            except Exception:
+                pass
+        for wid in list(workers):
+            proc, task_q = workers[wid]
+            proc.join(timeout=1)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=1)
+            try:
+                task_q.close()
+            except Exception:
+                pass
+        try:
+            result_queue.close()
+        except Exception:
+            pass
+
+    return [d for d in results if d is not None]
 
 
 def _run_rotation_analysis(symbols, start, end, strategy, capital, output, output_file, cmd_params='',
@@ -3727,7 +4017,7 @@ _LOW_CAP_50YI = 500000.0
 def _apply_scan_filters(stock_list, peplus=False, nost=False, nolowcap=False):
     """按 PE / 名称 / 总市值过滤股票列表 DataFrame（缺少对应列时该条件忽略）
 
-    PE 上限取自 pyproject.toml 的 PE_THRESHOLD（默认 100），高于阈值视为高估并剔除。
+    PE 上限取自 squant.toml 的 PE_THRESHOLD（默认 100），高于阈值视为高估并剔除。
     """
     if stock_list is None or len(stock_list) == 0:
         return stock_list
@@ -3751,6 +4041,7 @@ def _apply_scan_filters(stock_list, peplus=False, nost=False, nolowcap=False):
 @cli.command('scan')
 @_src_option
 @_seqnum_option
+@_maxhold_option
 @click.option('--strategy', '-g', default='boll,macd', help='策略选择，多个策略用逗号分隔，all表示全部（默认boll,macd）')
 @click.option('--top', '-t', default=5, type=click.IntRange(1, 100), help='筛选排名前N只股票 -tN（N=1~100，默认10）')
 @click.option('--offset', '-o', default=0, type=click.IntRange(0, 1000000), help='从获取到的股票中第N条记录开始分析 -oN（N=0起始，默认0=第一条）')
@@ -3767,7 +4058,7 @@ def _apply_scan_filters(stock_list, peplus=False, nost=False, nolowcap=False):
 @click.option('--nost', is_flag=True, default=False, help='排除 ST 股票（名称含 ST）')
 @click.option('--nolowcap', is_flag=True, default=False, help='排除总市值低于 50 亿元的股票')
 @click.option('--notify', is_flag=True, default=False, help='对扫描出的 Top N 股票通过钉钉机器人发送买卖信号通知')
-def scan_cmd(strategy, top, offset, min_volume, threads, forecast, sort_key, random, notify, src, peplus, nost, nolowcap, seqnum):
+def scan_cmd(strategy, top, offset, min_volume, threads, forecast, sort_key, random, notify, src, peplus, nost, nolowcap, seqnum, max_hold_days):
     """股票筛选：从全市场股票中，重点输出符合要求或最佳的股票
 
     流程：获取股票列表 -> 筛选 -> 逐个运行策略（可用 -x 并行）-> 输出结果
@@ -3784,6 +4075,7 @@ def scan_cmd(strategy, top, offset, min_volume, threads, forecast, sort_key, ran
     try:
         set_primary_source(src)
         _set_seqnum(seqnum)
+        _set_max_hold_days(max_hold_days)
         # 解析策略列表
         strat_specs = _split_strategies(strategy)
         if any(k == 'all' for k in strat_specs):
@@ -4359,9 +4651,8 @@ def _run_onestock_backtest(symbols, start_date, end_date, strat_keys, strat_enha
         _ret_sum = sum(t['return'] for t in trades)
         trade_rows.append(['汇总', '', '', '', '', '', '', _hd_sum,
                            f'{_ret_sum * 100:.2f}%', f'{_pnl_sum:,.0f}', ''])
-        _print_section('交易明细')
-        _print_table(trade_headers, trade_rows)
 
+    html_path = None
     try:
         tables = [('回测结果（按策略分类）', breakdown_headers, breakdown_rows)]
         if trade_rows:
@@ -4382,6 +4673,14 @@ def _run_onestock_backtest(symbols, start_date, end_date, strat_keys, strat_enha
 
     click.echo()
     click.echo(click.style('  回测完成!', fg='green', bold=True))
+    return {
+        'result': result,
+        'trades': trades,
+        'equity': equity,
+        'html_path': html_path,
+        'breakdown_headers': breakdown_headers,
+        'breakdown_rows': breakdown_rows,
+    }
 
 
 # ============================================================================
@@ -4392,10 +4691,11 @@ def _run_onestock_backtest(symbols, start_date, end_date, strat_keys, strat_enha
 @cli.command('backtest')
 @_src_option
 @_seqnum_option
+@_maxhold_option
 @click.option('--symbol', '-s', default=None, help='股票代码（与 -sf 至少指定一个）')
 @click.option('--symbol-file', '-sf', default=None, help='从指定文件读取股票代码进行批量回测（空格/逗号/换行分隔），仅处理有效 6 位代码并忽略名称，与 -s 同时使用时合并')
 @click.option('--random', is_flag=True, default=False, help='按 沪市主板:深市主板:创业板:科创板=6:5:5:2 比例随机抽取 100 只股票回测（忽略 -s 和 -sf），完成后将代码写入 report/random_<mmddHHMM>.txt')
-@click.option('--strategy', '-g', default='boll,macd',     help='策略选择 [ma1030|ema1030|macd|boll|kdj|sar|ma310|ma520|ema520|quality_value|hold|all]，多个用逗号分隔，all表示全部（默认boll,macd）')
+@click.option('--strategy', '-g', default='boll,macd',     help='策略选择 [ma1030|ema1030|macd|macd1|boll|kdj|sar|ma310|ma520|ema520|quality_value|hold|all]，多个用逗号分隔，all表示全部（默认boll,macd）')
 @click.option('--start', '-st', default=None, help='开始日期（默认1年前），格式: YYYYMMDD')
 @click.option('--end', '-e', default=None, help='结束日期，格式: YYYYMMDD')
 @click.option('--capital', '-c', default=100, type=float, help='初始资金（单位：万元，默认100万元）')
@@ -4405,11 +4705,12 @@ def _run_onestock_backtest(symbols, start_date, end_date, strat_keys, strat_enha
               help='单持仓轮动回测 [N]：空仓时按 -g 策略顺序优先选择靠前策略发出买入信号的股票，待该策略卖出时清仓。N=0（默认）：持仓时忽略新买入信号；N=1：持仓时若有其它股票买入信号，且当前股票 RSI > 75，则卖出换股（同一只不操作）。--random 下每次空仓刷新随机股票池')
 @click.option('--fixcapital', is_flag=True, default=False, help='固定资金模式：每次买入均按初始资金额度买入，上一轮交易的盈亏不影响本轮交易资金')
 @click.option('--verbose', is_flag=True, default=False, help='批量回测时额外输出每只股票单独的 HTML 回测报告（含K线/信号/权益图表）')
-def backtest_cmd(symbol, symbol_file, random, strategy, start, end, capital, output, chart, src, onestock, fixcapital, verbose, seqnum):
+def backtest_cmd(symbol, symbol_file, random, strategy, start, end, capital, output, chart, src, onestock, fixcapital, verbose, seqnum, max_hold_days):
     """回测：重点输出开始日期至结束日期之间的买卖点及收益率、夏普比率、回撤等信息
 
     流程：获取数据 -> 运行策略 -> 回测 -> 展示详细结果 -> 生成图表
     指定 -sf 时对多个股票批量回测，输出表格（每只股票一行，各项指标作为列）。
+    未指定 -s/-sf 时默认采用 -sf input/pool.txt。
     指定 --random 时按板块比例随机抽样 100 只股票批量回测，并写入 report/random_<mmddHHMM>.txt。
     -g 支持多个策略（逗号或竖线分隔）。
     """
@@ -4417,6 +4718,7 @@ def backtest_cmd(symbol, symbol_file, random, strategy, start, end, capital, out
         set_primary_source(src)
         _set_fix_capital(fixcapital)
         _set_seqnum(seqnum)
+        _set_max_hold_days(max_hold_days)
         capital = capital * 10000  # -c 单位为万元，内部换算为元
         strat_specs = _split_strategies(strategy)
         if any(s == 'all' for s in strat_specs):
@@ -4470,8 +4772,15 @@ def backtest_cmd(symbol, symbol_file, random, strategy, start, end, capital, out
             symbols = list(dict.fromkeys(symbols))
 
         if not symbols:
-            click.echo(click.style('  错误: 请使用 -s 或 -sf 指定至少一个股票代码', fg='red'))
-            return
+            # 未指定 -s/-sf 时，默认采用 -sf input/pool.txt
+            pool_path = os.path.join(app_root(), 'input', 'pool.txt')
+            file_symbols = _read_symbols_file(pool_path)
+            if not file_symbols:
+                click.echo(click.style(
+                    '  错误: 未指定 -s/-sf，且 input/pool.txt 无有效股票代码', fg='red'))
+                return
+            symbols = file_symbols
+            symbol_file = pool_path
 
         # 报告文件名中的 <file> 部分：--random → random；-sf → 文件名（不含路径/扩展名）；否则为 -s 股票代码
         if random:
@@ -5081,7 +5390,7 @@ def backtest_cmd(symbol, symbol_file, random, strategy, start, end, capital, out
 
         # 交易明细：每笔买卖的时间与该时段盈亏
         trade_headers, trade_rows = _build_trades_detail_table(risk.get('trades_df'))
-        if trade_rows:
+        if trade_rows and not _MAX_HOLD_DAYS:
             _print_section('交易明细（买卖时间与盈亏）')
             _print_table(trade_headers, trade_rows)
 
@@ -5139,12 +5448,13 @@ def backtest_cmd(symbol, symbol_file, random, strategy, start, end, capital, out
 @cli.command('compare')
 @_src_option
 @_seqnum_option
+@_maxhold_option
 @click.option('--symbol', '-s', required=True, help='股票代码（必需）')
 @click.option('--start', '-st', default=None, help='开始日期（默认180天前），格式: YYYYMMDD')
 @click.option('--end', '-e', default=None, help='结束日期，格式: YYYYMMDD')
 @click.option('--capital', '-c', default=100, type=float, help='初始资金（单位：万元，默认100万元）')
 @click.option('--chart', is_flag=True, default=False, help='生成策略对比图（默认仅输出表格报告）')
-def compare_cmd(symbol, start, end, capital, chart, src, seqnum):
+def compare_cmd(symbol, start, end, capital, chart, src, seqnum, max_hold_days):
     """策略对比：重点输出策略的对比结果
 
     流程：同时运行所有策略 -> 对比回测结果 -> 生成对比图表 -> 输出排名
@@ -5152,6 +5462,7 @@ def compare_cmd(symbol, start, end, capital, chart, src, seqnum):
     try:
         set_primary_source(src)
         _set_seqnum(seqnum)
+        _set_max_hold_days(max_hold_days)
         capital = capital * 10000  # -c 单位为万元，内部换算为元
         start_date, end_date = _parse_dates(start, end)
 
@@ -5289,71 +5600,6 @@ def compare_cmd(symbol, start, end, capital, chart, src, seqnum):
         click.echo(click.style(f'\n  错误: {e}', fg='red', bold=True))
         import traceback
         click.echo(click.style(traceback.format_exc(), fg='red'))
-
-
-# ============================================================================
-# select 命令 - 维护 input/pool.txt 股票池
-# ============================================================================
-
-
-@cli.command('select')
-@click.option('--add', '-add', default=None,
-              help='要添加的股票代码，多个以空格/逗号分隔（如 "600036 000001"）')
-@click.option('--rm', '-rm', 'remove', default=None,
-              help='要删除的股票代码，多个以空格/逗号分隔（如 "600036 000001"）')
-def select_cmd(add, remove):
-    """维护股票池：向 input/pool.txt 添加或删除股票代码
-
-    示例：
-        python3 main.py select -add "600036 000001"
-        python3 main.py select -rm "000001"
-        python3 main.py select -add "600036,000001" -rm "000001"
-    """
-    pool_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'input', 'pool.txt')
-
-    def _parse_codes(text):
-        return [x for x in re.split(r'[,\s]+', text or '') if x]
-
-    add_codes = _parse_codes(add)
-    rm_codes = _parse_codes(remove)
-    if not add_codes and not rm_codes:
-        click.echo(click.style('  错误: 请使用 -add 或 -rm 指定股票代码', fg='red'))
-        return
-
-    codes = []
-    if os.path.exists(pool_path):
-        with open(pool_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                codes.extend(_parse_codes(line))
-    # 去重并保持原有顺序
-    codes = list(dict.fromkeys(codes))
-    before_count = len(codes)
-
-    added = []
-    for c in add_codes:
-        if c not in codes:
-            codes.append(c)
-            added.append(c)
-
-    rm_set = set(rm_codes)
-    removed = [c for c in codes if c in rm_set]
-    codes = [c for c in codes if c not in rm_set]
-    missing = [c for c in rm_codes if c not in removed]
-
-    os.makedirs(os.path.dirname(pool_path), exist_ok=True)
-    with open(pool_path, 'w', encoding='utf-8') as f:
-        for c in codes:
-            f.write(c + '\n')
-
-    if added:
-        click.echo(click.style(f'  已添加: {" ".join(added)}', fg='green'))
-    if removed:
-        click.echo(click.style(f'  已删除: {" ".join(removed)}', fg='yellow'))
-    if missing:
-        click.echo(click.style(f'  未找到: {" ".join(missing)}', fg='red'))
-    if not added and add_codes:
-        click.echo(click.style('  添加的代码均已存在', fg='cyan'))
-    click.echo(click.style(f'  股票池: {before_count} 只 -> {len(codes)} 只 ({pool_path})', fg='cyan'))
 
 
 # ============================================================================
