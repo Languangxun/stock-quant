@@ -61,8 +61,6 @@ class MACrossStrategy(Strategy):
             - 死叉：快线下穿慢线（上一期快线 >= 上一期慢线 且 当期快线 < 当期慢线）→ 卖出(-1)
             - 其余情况 → 持有(0)
 
-        本策略不区分增强级别。
-
         Args:
             df (pd.DataFrame): 行情数据，必须包含 'close' 列
 

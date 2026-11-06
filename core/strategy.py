@@ -30,16 +30,12 @@ class Strategy(ABC):
         """
         self.name = name
 
-    def signal_value(self, direction, strong=False):
+    def signal_value(self, direction):
         """
-        返回带方向的信号值：统一为 ±1.0（买入 +1 / 卖出 -1）
-
-        弱买/强买已合并为「买」(1)，弱卖/强卖已合并为「卖」(-1)；
-        `strong` 参数仅为兼容保留，不再影响取值。
+        返回带方向的信号值：买入 +1.0 / 卖出 -1.0
 
         Args:
             direction (int): +1 表示买入方向，-1 表示卖出方向
-            strong (bool): 已废弃，忽略
 
         Returns:
             float: 信号值（+1.0 或 -1.0）
@@ -71,7 +67,7 @@ class Strategy(ABC):
 
         规则：
             - 初始残值 = 0
-            - 出现买卖信号时，残值 = 信号值（强买 1 / 弱买 0.5 / 弱卖 -0.5 / 强卖 -1）
+            - 出现买卖信号时，残值 = 信号值（买入 1 / 卖出 -1）
             - 无买卖信号（信号为 0）时，残值 = 上一期残值 / 2（逐日衰减）
 
         Args:

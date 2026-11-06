@@ -33,7 +33,7 @@ class RSIStrategy(Strategy):
     """
 
     def __init__(self, period=14, oversold=UNSET, overbought=UNSET,
-                 enh_oversold=25, enh_overbought=75, name='RSI'):
+                 name='RSI'):
         """
         初始化 RSI 策略
 
@@ -58,11 +58,6 @@ class RSIStrategy(Strategy):
             - RSI 从超卖区（< oversold）上穿 oversold 阈值 → 买入(1)
             - RSI 从超买区（> overbought）下穿 overbought 阈值 → 卖出(-1)
             - 其余情况 → 持有(0)
-
-        增强级别 1（enhance>=1）时，改用更深超卖/超买阈值判定（超卖 25、超买 75）：
-            - 买入：RSI 从更超卖区（< 25）上穿 25 → 强买(1)
-            - 卖出：RSI 从更超买区（> 75）下穿 75 → 强卖(-1)
-            增强条件与基础条件不同，因此仅满足基础条件（30/70）时仍出弱信号（±0.5）。
 
         Args:
             df (pd.DataFrame): 行情数据，必须包含 'close' 列

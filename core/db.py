@@ -536,11 +536,12 @@ def store_indicators(code: str, df, exchange: str = None,
 
 
 def fetch_valuation(code: str, start_date: str = '2010-01-01',
-                    exchange: str = None, asset_type: str = 'stock') -> list:
-    """读取估值历史数据"""
+                    exchange: str = None, asset_type: str = 'stock',
+                    force: bool = False) -> list:
+    """读取估值历史数据；force=True 时忽略 _DB_MODE。"""
     code, exchange, asset_type = normalize_instrument(code, exchange, asset_type)
     try:
-        with get_connection() as conn:
+        with get_connection(force=force) as conn:
             if conn is None:
                 return []
             cursor = conn.cursor()

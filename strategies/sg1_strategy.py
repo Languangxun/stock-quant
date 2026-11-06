@@ -9,7 +9,7 @@ SG1 策略（策略1）
 
 阈值读取 squant.toml 的 thresholds 配置（默认 MIN_RSI=25 / MAX_RSI=85 / 回撤15%）。
 
-本策略无强买/强卖条件（不随增强级别变化）。
+本策略只输出买入(1)/卖出(-1)/观望(0)。
 """
 
 import pandas as pd
@@ -21,7 +21,7 @@ from core.thresholds import UNSET, get_threshold, get_max_drawdown_threshold
 
 
 class SG1Strategy(Strategy):
-    """SG1 策略：MA3/MA10 交叉（严格买入 + 最大回撤止损保护，无强信号）
+    """SG1 策略：MA3/MA10 交叉（严格买入 + 最大回撤止损保护）
 
     Attributes:
         fast_period (int): 快线周期，默认 3
@@ -137,7 +137,7 @@ class SG1Strategy(Strategy):
                              and (sar_ok is None or bool(sar_ok.iloc[i]))
                              and (index_ok is None or bool(index_ok.iloc[i])))
                     if allow:
-                        signals.iloc[i] = self.signal_value(1)      # 弱买 +0.5
+                        signals.iloc[i] = self.signal_value(1)      # 买入
                         in_pos = True
                         peak = c
                         buy_count = 0
@@ -146,11 +146,11 @@ class SG1Strategy(Strategy):
                     peak = c
                 dd = (peak - c) / peak if peak > 0 else 0.0
                 if self.max_drawdown is not None and dd >= self.max_drawdown:
-                    signals.iloc[i] = self.signal_value(-1)     # 回撤止损（弱卖 -0.5）
+                    signals.iloc[i] = self.signal_value(-1)     # 回撤止损
                     in_pos = False
                     buy_count = 0
                 elif sell_signal:
-                    signals.iloc[i] = self.signal_value(-1)     # 死叉或 RSI 超买（弱卖 -0.5）
+                    signals.iloc[i] = self.signal_value(-1)     # 死叉或 RSI 超买
                     in_pos = False
                     buy_count = 0
 

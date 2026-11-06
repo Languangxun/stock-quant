@@ -33,12 +33,12 @@ class HoldStrategy(Strategy):
 
     def generate_signals(self, df):
         """
-        生成买入并持有信号：前 warmup 根观望，之后全部强买(1) 并持有到结束
+        生成买入并持有信号：前 warmup 根观望，之后全部买入(1) 并持有到结束
 
         Returns:
             pd.Series: 交易信号序列，索引与 df 对齐
         """
         signals = pd.Series(0.0, index=df.index, dtype=float)
         start = min(self.warmup, len(df))
-        signals.iloc[start:] = self.signal_value(1, strong=True)
+        signals.iloc[start:] = self.signal_value(1)
         return signals

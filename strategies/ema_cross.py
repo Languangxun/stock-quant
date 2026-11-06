@@ -91,7 +91,7 @@ class EMACrossStrategy(Strategy):
         if self.rsi_sell_min is not None:
             death_cross = death_cross | (rsi > self.rsi_sell_min)
 
-        # 基础版条件 → 弱信号
+        # 金叉/死叉信号
         signals[golden_cross] = self.signal_value(1)
         signals[death_cross] = self.signal_value(-1)
 

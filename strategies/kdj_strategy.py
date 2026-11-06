@@ -63,7 +63,6 @@ class KDJStrategy(Strategy):
             - 死叉卖出：上一期 K >= D，当期 K < D
             - 其余情况 → 持有(0)
 
-        本策略不区分增强级别（买卖判定固定）。
 
         Args:
             df (pd.DataFrame): 行情数据，必须包含 'high'、'low'、'close' 列

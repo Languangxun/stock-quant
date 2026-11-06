@@ -62,10 +62,10 @@ class BacktestEngine:
             df (pd.DataFrame): 行情数据，必须包含 'close' 列
             signals (pd.Series): 交易信号序列，1=买入, -1=卖出, 0=持有
             position_style (str): 持仓模式
-                - 'full': 全仓买卖模式，信号≥0.5时全仓买入，信号≤-0.5时全仓卖出
+                - 'full': 全仓买卖模式，信号 > 0 时全仓买入，信号 < 0 时全仓卖出
                 - 'fraction': 按信号比例模式，仓位水平 in_position 为 0~1 浮点数：
-                    弱买(+0.5)/强买(+1) 时 in_position 累加（封顶1）并买入对应比例资金；
-                    弱卖(-0.5)/强卖(-1) 时 in_position 递减（下限0）并卖出对应比例持仓；
+                    买入信号时 in_position 累加（封顶1）并买入对应比例资金；
+                    卖出信号时 in_position 递减（下限0）并卖出对应比例持仓；
                     in_position<1 时可加仓，in_position>0 时可减仓
 
         Returns:
@@ -135,8 +135,8 @@ class BacktestEngine:
 
             if position_style == 'full':
                 # ---- 全仓买卖模式 ----
-                if signal >= 0.5 and in_position < 1.0:
-                    # 买入信号（含弱买/强买）：全仓买入
+                if signal > 0 and in_position < 1.0:
+                    # 买入信号：全仓买入
                     # 固定资金模式：每次按初始资金额度买入（上轮盈亏不影响本轮资金）
                     buy_capital = self.initial_capital if self.fix_capital else cash
                     trade_amount = buy_capital * (1 - self.commission)  # 扣除佣金后的可用资金
@@ -151,8 +151,8 @@ class BacktestEngine:
                     entry_date = df.index[i] if isinstance(df.index, pd.DatetimeIndex) else i
                     entry_idx = i
 
-                elif signal <= -0.5 and in_position > 0:
-                    # 卖出信号（含弱卖/强卖）：全仓卖出
+                elif signal < 0 and in_position > 0:
+                    # 卖出信号：全仓卖出
                     proceeds = shares_held * exec_price * (1 - self.commission)
                     cash += proceeds
 
@@ -180,7 +180,7 @@ class BacktestEngine:
             elif position_style == 'fraction':
                 # ---- 按信号比例模式：in_position 为 0~1 的仓位水平 ----
                 if signal > 0 and in_position < 1.0:
-                    # 买入：仓位水平按信号强度累加（弱买 +0.5 / 强买 +1），封顶 1
+                    # 买入：按信号强度累加仓位，封顶 1
                     increment = min(abs(signal), 1.0 - in_position)
                     # 固定资金模式：按初始资金额度计算买入金额
                     target_value = (self.initial_capital if self.fix_capital else cash) * increment
@@ -199,7 +199,7 @@ class BacktestEngine:
                     buy_count += 1
 
                 elif signal < 0 and in_position > 0:
-                    # 卖出：仓位水平按信号强度递减（弱卖 -0.5 / 强卖 -1），下限 0
+                    # 卖出：按信号强度递减仓位，下限 0
                     decrement = min(abs(signal), in_position)
                     sell_fraction = min(1.0, decrement / in_position)
                     shares_to_sell = shares_held * sell_fraction

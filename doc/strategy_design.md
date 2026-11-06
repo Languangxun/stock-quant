@@ -17,7 +17,8 @@
 | `0` | 观望 | 观 |
 | `-1` | 卖出 | 卖 |
 
-> **强弱信号已合并**：原先的弱买 `+0.5` / 强买 `+1` 统一为「买」`+1`，弱卖 `-0.5` / 强卖 `-1` 统一为「卖」`-1`。
+> **信号值约定**：买入 `+1`、卖出 `-1`、观望 `0`。
+> **每日量化评分 `signals.attrs["score"]`**：详见 0.1.1。
 > 回测中（fraction 模式）仓位水平 `in_position` 为 0~1 浮点数，按 `±1` 累加/递减并封顶：`in_position<1` 时买入、`>0` 时卖出。
 >
 > 质价融合策略会额外在 `signals.attrs` 中附加 `combined_score`（综合得分）、`z_score`（Z 分数）与 `stock_type`（标的类型）。
@@ -62,6 +63,95 @@
 > **注意**：若一个「卖出→买入」区间内只有一个买入信号，`-sn N>1` 仍不会产生交易；只有存在多个买入条件时
 > （如 000333 BOLL 的 2026-03-24 与 2026-03-31）才能正常触发。
 
+### 0.1.1 每日量化评分 score（计算与应用）
+
+#### 数据结构
+
+每个策略返回的 `signals` 除了买卖值外，还会附带：
+
+```python
+signals.attrs['score'] = pd.Series(
+    data=...,              # 每日评分
+    index=signals.index,   # 与信号/行情索引一致
+    dtype='int64',
+)
+```
+
+- 类型：`pandas.Series`，整数；
+- 索引：与 `signals.index`、`df.index` 对齐；
+- 范围：不固定为 `-100~100`，按各指标实际累加结果为准；
+- 当前不写入数据库，只存在于内存中的 `signals.attrs`。
+- 同时附加 `signals.attrs['score_detail']`，为与信号同索引的文本 Series，
+  格式如 `+MA,EMA；-KDJ`，用于展示每日加减分来源；没有正/负贡献时不显示对应符号。
+
+#### 计算公式
+
+```text
+score_t = Σ component_i(t)
+```
+
+每个独立指标贡献 `-1 / 0 / +1`，直接累加，不缩放、不裁剪：
+
+| 指标 | 加分条件（+1） | 减分条件（-1） |
+|------|----------------|----------------|
+| MA | `price > MA5 > MA10` | `price < MA5 < MA10` |
+| EMA | `price > EMA12 > EMA26` | `price < EMA12 < EMA26` |
+| DMI | `25 < ADX < 50` 且 `+DI > -DI` | `25 < ADX < 50` 且 `+DI < -DI` |
+| AMT | amount 近5日新高且 price 近5日新高 | amount 近5日新高且 price 近5日新低 |
+| RSI | `RSI < 30` | `RSI > 70` |
+| WR | 正向 WR > 80（超卖） | 正向 WR < 20（超买） |
+| SAR | `price > SAR` | `price < SAR` |
+| PE | `0 < PE < 50` | `PE < 0`（亏损） |
+| KDJ | `K < 20` 或 `J < 0` | `D > 80` 或 `J > 100` |
+
+补充规则：
+
+- AMOUNT 指标已取消：资金放大不能确定买卖方向，因此不再参与评分。
+- 内部 `WR14` 为 `-100~0` 方向，计算时先取反为正向 `0~100`；
+  - 正向 WR > 80 表示收盘靠近区间低点（超卖），记 +1；
+  - 正向 WR < 20 表示收盘靠近区间高点（超买），记 -1。
+- PE 优先读取 `valuation_history.pe_ttm`：
+  - 先按推断的资产类型查询；
+  - 查不到时回退 `asset_type='stock'`；
+  - 无 PE 数据时该分量记 0。
+- 任一指标缺失时，对应分量记 0，不影响其他分量。
+
+#### 应用位置
+
+1. **策略信号**：所有策略及 PREV/复合策略的信号都会附加 `score`。
+2. **Analyze 控制台/HTML**：
+   - 逐策略信号和策略排名显示 `买入 (+3)` 形式；
+   - 最新信号表列顺序为：`股票代码名称 | 最新价格 | 各策略... | 评分 | 评分详情`。
+3. **Scan 控制台/HTML**：
+   - 多策略和单策略扫描结果均包含“评分”和“评分详情”列；
+   - 评分详情格式：`+MA,EMA；-KDJ`；没有“+”或“-”项时不显示对应符号；
+   - 排序规则为：买 > 卖 > 观望，同组按 `score` 从大到小。
+4. **分析参考**：
+   - `score` 当前不参与买卖信号的生成；
+   - 仅用于对买卖信号做进一步参考、排序和展示。
+
+#### 与 `combined_score` / `z_score` 的区别
+
+| 属性 | 来源 | 含义 |
+|------|------|------|
+| `score` | `core/scoring.py` | 9 个独立技术指标直接累加的整数评分 |
+| `combined_score` | 质价融合策略 | 估值/质量/筹码/增减持/波动率加权得分，0~1 |
+| `z_score` | 质价融合策略、复合策略 | 对综合得分/加权信号做滚动标准化后的 Z 分数 |
+
+三者用途不同，不要混用。
+
+#### 代码位置
+
+| 功能 | 位置 |
+|------|------|
+| 评分计算 | `core/scoring.py:compute_daily_score()` |
+| 附加到信号 | `main.py:_attach_daily_score()` |
+| 读取最新评分 | `main.py:_get_latest_score()` |
+| 读取最新评分详情 | `main.py:_get_latest_score_detail()` |
+| 显示格式 | `main.py:_score_suffix()` |
+| 最新信号表评分列 | `main.py:_build_signal_table()` |
+| Scan 评分列 | `main.py:_scan_single()` / `_scan_multi()` |
+
 ### 0.2 策略分类总览
 
 | 分类 | 策略（显示名） | 注册 key | 适用标的 |
@@ -84,7 +174,7 @@
 
 > `-g all` 展开为 `ALL_SELECTION = ['ema1030','macd','boll','kdj','sar','ema520','hold']`，**不含 `ma1030` / `ma310` / `ma520`**（仍可通过 `-g ma1030` 等单独指定）。ETF 模式的 `-g all` 另含 `quality_value`。
 > 全量注册表 `ALL_STRATEGIES` 仍保留 `ma1030` / `ma310` / `ma520`，供 `compare` 使用。
-> `analyze` 命令除 `-g` 所选策略外，还会**自动追加 PREV 策略**（见 3.3）。
+> `analyze` 命令除 `-g` 所选策略外，会在**内部计算 PREV 策略**作为参考，但不再加入屏幕/HTML/通知输出（见 3.3）。
 > `backtest` 命令除 `-g` 所选策略外，还会**自动追加复合策略**（key `combo`，见 3.4）。
 > RSI 策略与加权投票综合策略（`composite`）已不再注册到 CLI（见第六节）。
 
@@ -484,7 +574,7 @@ z_t = (combined_smooth,t - μ_window) / σ_window
 
 ---
 
-### 3.3 PREV 策略（analyze 自动追加，非 `-g` 可选）
+### 3.3 PREV 策略（analyze 内部计算，不参与输出）
 
 **定位：** 对 `-g` 所选策略**上一交易日**的信号做多数表决，作为"隔日确认"的合成信号。
 
@@ -498,7 +588,7 @@ z_t = (combined_smooth,t - μ_window) / σ_window
 
 - 首个交易日无前一交易日，记为观望 `0`。
 - 信号实现为：将各所选策略信号按日期 `shift(1)`，逐日比较 `>0`（买）与 `<0`（卖）的数量。
-- 显示名 `PREV`（key `prev`）；`analyze` 会对其照常做回测、纳入策略对比排名、最新信号表、HTML 报告与钉钉通知。
+- 显示名 `PREV`（key `prev`）；`analyze` 会对其照常做回测，但不再纳入策略对比排名、最新信号表、HTML 报告与钉钉通知。
 - 仅 `analyze` 命令自动追加；`scan`/`backtest`/`compare` 不含。
 
 ---
@@ -520,7 +610,7 @@ z_t = (combined_smooth,t - μ_window) / σ_window
 - 持仓期间其它策略的卖出信号不影响复合策略（只等被记住策略的卖出）。
 - 不考虑 PREV 与 Hold 策略的信号（`hold` 被排除）。
 - 无有效来源策略时，复合策略不追加。
-- 仅 `backtest` 命令自动追加（单股多策略与批量回测均适用）；`analyze` 用 PREV、`scan`/`compare` 不含合成策略。
+- 仅 `backtest` 命令自动追加（单股多策略与批量回测均适用）；`analyze` 内部计算 PREV 但不输出，`scan`/`compare` 不含合成策略。
 
 ---
 
