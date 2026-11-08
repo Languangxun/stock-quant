@@ -1088,6 +1088,155 @@ class ChartGenerator:
         return save_path
 
     @_synchronized_plot
+    def plot_index_equity_with_trades(self, index_df, equity_curve, trades,
+                                      title='指数K线与权益曲线', save_path=None):
+        """单图叠加：指数K线 + 权益曲线（次坐标轴）+ 买卖三角标记。
+
+        只使用一个 mplfinance panel，不生成成交量/指标/权益子图。
+        """
+        if save_path is None:
+            save_path = self._get_save_path('index_equity.png')
+        if index_df is None or len(index_df) == 0:
+            raise ValueError('指数数据为空')
+
+        df = index_df.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if 'date' in df.columns:
+                df = df.set_index('date')
+            df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+
+        rename_map = {}
+        for old_col, new_col in (('open', 'Open'), ('high', 'High'),
+                                 ('low', 'Low'), ('close', 'Close')):
+            if old_col in df.columns and new_col not in df.columns:
+                rename_map[old_col] = new_col
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        for col in ('Open', 'High', 'Low', 'Close'):
+            if col not in df.columns:
+                raise ValueError(f'缺少必要列: {col}')
+
+        if isinstance(equity_curve, pd.Series):
+            eq = equity_curve.copy()
+        else:
+            eq = pd.Series(list(equity_curve or []))
+        if not isinstance(eq.index, pd.DatetimeIndex):
+            eq.index = pd.to_datetime(eq.index)
+        eq = eq.sort_index().reindex(df.index, method='ffill')
+
+        eq_plot = mpf.make_addplot(eq, panel=0, secondary_y=True,
+                                   color=COLOR_BLUE, width=1.5,
+                                   ylabel='权益', label='权益')
+        mc = mpf.make_marketcolors(up=COLOR_UP, down=COLOR_DOWN,
+                                   edge='inherit', wick='inherit', alpha=0.9)
+        style = mpf.make_mpf_style(
+            marketcolors=mc, gridstyle=':', gridcolor='#e0e0e0',
+            facecolor=COLOR_BG, figcolor=COLOR_BG, y_on_right=False,
+            rc={'font.sans-serif': [FP_REGULAR.get_name(), 'DejaVu Sans'],
+                'axes.unicode_minus': False})
+
+        fig, axes = mpf.plot(
+            df, type='candle', style=style, addplot=[eq_plot], volume=False,
+            returnfig=True, figsize=(16, 7),
+            warn_too_much_data=len(df) + 1,
+            datetime_format='%Y-%m', xrotation=0)
+
+        ax = axes[0]
+        eq_ax = axes[1]
+
+        def _pos(date):
+            ts = pd.Timestamp(date).normalize()
+            pos = df.index.get_indexer([ts], method='ffill')[0]
+            return None if pos < 0 else int(pos)
+
+        seen_buy, seen_sell = set(), set()
+        for t in trades or []:
+            pos = _pos(t.get('entry_date'))
+            if pos is not None and pos not in seen_buy:
+                y = float(df['Low'].iloc[pos]) * 0.995
+                ax.scatter([pos], [y], marker='^', s=90, color=COLOR_UP,
+                           edgecolors=COLOR_UP, zorder=6, clip_on=True)
+                ax.annotate(str(t.get('symbol') or ''), xy=(pos, y),
+                            xytext=(0, -12), textcoords='offset points',
+                            ha='center', va='top', fontsize=8, color=COLOR_UP,
+                            fontproperties=FP_REGULAR, zorder=7,
+                            bbox=dict(boxstyle='round,pad=0.15', fc='white',
+                                      ec='none', alpha=0.75))
+                seen_buy.add(pos)
+            pos = _pos(t.get('exit_date'))
+            if pos is not None and pos not in seen_sell:
+                y = float(df['High'].iloc[pos]) * 1.005
+                ax.scatter([pos], [y], marker='v', s=90, color=COLOR_DOWN,
+                           edgecolors=COLOR_DOWN, zorder=6, clip_on=True)
+                seen_sell.add(pos)
+
+        # 分区显示：指数K线放在下方，权益曲线放在上方，避免二者交叉。
+        try:
+            buy_lows = []
+            for t in (trades or []):
+                pos = _pos(t.get('entry_date'))
+                if pos is not None:
+                    buy_lows.append(float(df['Low'].iloc[pos]) * 0.995)
+            px_min = float(df['Low'].min())
+            px_max = float(df['High'].max())
+            if buy_lows:
+                px_min = min(px_min, min(buy_lows))
+            if px_max <= px_min:
+                px_max = px_min + max(abs(px_min) * 0.02, 1.0)
+            k_lo, k_hi = 0.10, 0.56
+            k_span = (px_max - px_min) / (k_hi - k_lo)
+            k_ymin = px_min - k_lo * k_span
+            ax.set_ylim(k_ymin, k_ymin + k_span)
+
+            # 权益轴自动设置，并将权益曲线起点放在约 2/3 图表高度处
+            eq_valid = eq.dropna()
+            if len(eq_valid) > 0:
+                eq_start = float(eq_valid.iloc[0])
+                eq_min = float(eq_valid.min())
+                eq_max = float(eq_valid.max())
+                target = 2.0 / 3.0
+                span = max((eq_start - eq_min) / target,
+                           (eq_max - eq_start) / (1.0 - target))
+                span = max(span, abs(eq_start) * 0.05, 1.0) * 1.08
+                eq_lower = eq_start - target * span
+                eq_ax.set_ylim(eq_lower, eq_lower + span)
+            else:
+                eq_ax.set_ylim(-1_000_000, 2_000_000)
+            eq_ax.yaxis.set_major_formatter(
+                mticker.FuncFormatter(lambda x, _: f'{x / 10000:,.0f}'))
+        except Exception:
+            pass
+
+        from matplotlib.lines import Line2D
+        handles = [
+            Line2D([0], [0], marker='^', linestyle='None',
+                   markerfacecolor=COLOR_UP, markeredgecolor=COLOR_UP,
+                   markersize=9, label='买入'),
+            Line2D([0], [0], marker='v', linestyle='None',
+                   markerfacecolor=COLOR_DOWN, markeredgecolor=COLOR_DOWN,
+                   markersize=9, label='卖出'),
+            Line2D([0], [0], color=COLOR_BLUE, lw=1.5, label='权益'),
+        ]
+        ax.legend(handles=handles, loc='upper left', fontsize=9,
+                  framealpha=0.75, prop=FP_REGULAR)
+        ax.set_ylabel('指数点位', fontproperties=FP_REGULAR)
+        eq_ax.set_ylabel('权益(万元)', fontproperties=FP_REGULAR)
+
+        for a in axes:
+            for label in (a.get_xticklabels() + a.get_yticklabels()):
+                label.set_fontproperties(FP_REGULAR)
+
+        fig.suptitle(title, y=0.98, fontsize=12, fontproperties=FP_BOLD)
+        try:
+            fig.subplots_adjust(left=0.06, right=0.93, top=0.91, bottom=0.14)
+        except Exception:
+            pass
+        fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=COLOR_BG)
+        plt.close(fig)
+        return save_path
+
+    @_synchronized_plot
     def plot_multi_strategy_composite(self, df, strategies_data, title='多策略信号图表', save_path=None):
         """
         多策略综合图表：一个K线图，含各策略指标子图 + 汇总权益子图

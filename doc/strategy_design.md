@@ -98,6 +98,7 @@ score_t = Σ component_i(t)
 | EMA | `price > EMA12 > EMA26` | `price < EMA12 < EMA26` |
 | DMI | `25 < ADX < 50` 且 `+DI > -DI` | `25 < ADX < 50` 且 `+DI < -DI` |
 | AMT | amount 近5日新高且 price 近5日新高 | amount 近5日新高且 price 近5日新低 |
+| OBV | (ADX<25 且 RSI<30 且 OBV>OBV_MA20) 或 (ADX>25 且 +DI>-DI 且 OBV>OBV_MA20) | (ADX>25 且 price为10日新高 且 OBV非10日新高) 或 (ADX>25 且 price<price_MA10 且 OBV<OBV_MA10) |
 | RSI | `RSI < 30` | `RSI > 70` |
 | WR | 正向 WR > 80（超卖） | 正向 WR < 20（超买） |
 | SAR | `price > SAR` | `price < SAR` |
@@ -106,7 +107,7 @@ score_t = Σ component_i(t)
 
 补充规则：
 
-- AMOUNT 指标已取消：资金放大不能确定买卖方向，因此不再参与评分。
+- 原 AMOUNT（成交额 > MA20）指标已取消；量价条件改由 AMT 表示。
 - 内部 `WR14` 为 `-100~0` 方向，计算时先取反为正向 `0~100`；
   - 正向 WR > 80 表示收盘靠近区间低点（超卖），记 +1；
   - 正向 WR < 20 表示收盘靠近区间高点（超买），记 -1。
@@ -134,7 +135,7 @@ score_t = Σ component_i(t)
 
 | 属性 | 来源 | 含义 |
 |------|------|------|
-| `score` | `core/scoring.py` | 9 个独立技术指标直接累加的整数评分 |
+| `score` | `core/scoring.py` | 10 个独立技术指标直接累加的整数评分 |
 | `combined_score` | 质价融合策略 | 估值/质量/筹码/增减持/波动率加权得分，0~1 |
 | `z_score` | 质价融合策略、复合策略 | 对综合得分/加权信号做滚动标准化后的 Z 分数 |
 
@@ -224,6 +225,99 @@ score_t = Σ component_i(t)
   `BOLL_SQUEEZE_SCALE` / `BOLL_EXTRAWIDE_SCALE` / `bbw_lookback` 当前不生效（BOLL 带宽过滤已停用）。
 - 构造参数显式传入时以传入值为准；传 `None` 表示禁用该过滤（如显式传 `max_drawdown=None` 禁用回撤止损）。
 - 加载结果在进程内缓存，修改配置后需重新启动进程生效。
+
+---
+
+### 0.5 大盘趋势（Market Trend）
+
+大盘趋势用于调整策略原始信号，并在 `--onestock` 交易执行中提供市场环境判断。实现位于 `core/market_trend.py`，结果按需计算并进程内缓存，不写入数据库。
+
+#### 数据来源
+
+| 数据 | 来源 | 说明 |
+|------|------|------|
+| 趋势指数 | `squant.toml` 的 `market_trend_index` | 默认 `000852`（中证1000）；通过 `DataFetcher.get_index_data()` 获取，AkShare 作为长历史兜底 |
+| 涨跌家数 | `market_breadth` 表 | `universe_code='ALL_A'`，读取 `advance_count` / `decline_count` |
+| ADR(10) | 实时计算 | `ADR10 = 近10日上涨家数之和 / 近10日下跌家数之和`；**不是** `market_breadth.adr_ma10`（后者是日 ADR 的 10 日均值） |
+| BIAS20 | 指数日线 | `BIAS20 = (close - MA20) / MA20` |
+
+#### 指数趋势条件
+
+| 状态 | 指数条件 |
+|------|----------|
+| `上涨` | `(MA5 > MA20 > MA60 AND slope20 > 0 AND MACD_DIF > 0) OR (ADX14 >= 25 AND +DI > -DI)` |
+| `下跌` | `(MA5 < MA20 < MA60 AND slope20 < 0 AND MACD_DIF < 0) OR (ADX14 >= 25 AND +DI < -DI)` |
+
+其中 `slope20` 为 20 日收盘价线性回归斜率；上涨/下跌状态还会分别与 ADR10 条件取 AND。
+
+#### 状态判定
+
+| 状态 | 条件 |
+|------|------|
+| `上涨` | 指数上涨条件全部成立 **OR** `ADR10 > 1.2` |
+| `下跌` | 指数下跌条件全部成立 **OR** `ADR10 < 0.8` |
+| `震荡` | 震荡条件满足至少 2 条 **AND** `0.8 <= ADR10 <= 1.2` |
+| `过渡` | 不满足上涨、下跌、震荡、过热、过冷中的任一组合 |
+| `过热` | `上涨` **AND** `ADR10 > 1.75` **AND** `BIAS20 > 9%` |
+| `过冷` | `下跌` **AND** `ADR10 < 0.5` **AND** `BIAS20 < -9%` |
+| `未知` | 有效指标不足或 ADR 数据缺失 |
+
+震荡条件（`range_count`，满足任意 2 条）：
+
+1. `ADX14 < 25`；
+2. `|MA20 - MA60| / MA60 < 3%`；
+3. `|60日斜率 / 60日均值| < 0.001`；
+4. 60 日振幅 `max(high60) / min(low60) < 1.3`。
+
+状态赋值顺序：
+
+```text
+默认过渡
+→ 震荡条件 + ADR 区间成立：震荡
+→ 下跌条件 OR ADR<0.8：下跌
+→ 上涨条件 OR ADR>1.2：上涨
+→ 上涨 + ADR>1.75 + BIAS20>9%：过热
+→ 下跌 + ADR<0.5 + BIAS20<-9%：过冷
+→ 无效数据：未知
+```
+
+> 指数条件与 ADR 条件取 OR；若上涨/下跌条件同时成立，按赋值顺序“上涨”覆盖“下跌”。
+
+#### 应用位置
+
+| 位置 | 行为 |
+|------|------|
+| 所有策略原始信号 | `过热` 日买入信号置 0；`过冷` 日仅由最大回撤/最大持股天数等强制条件产生的卖出置 0；常规策略卖出保留 |
+| `--nodownbuy` | 在 `analyze` / `scan` / `backtest` / `compare` 中禁止 `下跌` 和 `过热` 日买入；作用于策略原始信号 |
+| `analyze` / `scan` 控制台与 HTML | 使用调整后的原始信号；显示趋势指数名称、日期、状态和 `ADR10` |
+| `--onestock` 买入 | 原始信号已包含过热禁买；`--nodownbuy` 额外禁止 `下跌` 日买入 |
+| `--onestock` 卖出 | 原始信号已抑制过冷强制卖出；`--downlosssell` 仅在 `下跌` 状态且持仓亏损>2%或单日跌幅>5%时触发，`过冷` 不触发 |
+| `--downlosssell` 买入优先级 | `上涨` 优先 MACD 买入信号；`震荡/过冷` 优先 BOLL 买入信号 |
+| 期末处理 | 期末仍按最后一个交易日收盘强制平仓，不受过热/过冷状态影响 |
+
+说明：
+
+- 过热/过冷在 `_generate_effective_signals()` 中统一作用于策略原始信号，覆盖 `analyze`、`scan`、普通 `backtest` 和 `--onestock`；
+- `--nodownbuy` 通过全局开关在 `_generate_effective_signals()` 中额外屏蔽 `下跌` 日买入；
+- 最大回撤来自策略内部，最大持股天数来自 `--maxholddays`；过冷时两者产生的卖出均被抑制；
+- `market_trend_states()` 供回测按日取状态，`analyze_market_trend()` 供界面显示最新状态；
+- 两个函数均使用 `lru_cache`，数据库刷新后需重启进程或清理缓存才能立即生效。
+
+#### 代码位置
+
+| 功能 | 位置 |
+|------|------|
+| 配置读取 | `core/market_trend.py:get_market_trend_index()` |
+| ADR(10) 计算 | `core/market_trend.py:_fetch_adr_series()` |
+| 逐日状态判定 | `core/market_trend.py:classify_market_trend_series()` |
+| 区间状态序列 | `core/market_trend.py:market_trend_states()` |
+| 最新趋势分析 | `core/market_trend.py:analyze_market_trend()` |
+| 涨跌家数读取 | `core/db.py:fetch_market_breadth_counts()` |
+| 屏幕/HTML 显示 | `main.py:_format_market_trend()` / `_print_market_trend()` / `_market_trend_html()` |
+| `--nodownbuy` | `main.py:_apply_market_regime_to_signals()` / `_set_block_buy_on_downtrend()` |
+| `--downlosssell` | `main.py:_run_onestock_backtest()` |
+| onestock 买卖行为 | `main.py:_run_onestock_backtest()` |
+| 趋势指数配置 | `squant.toml` → `market_trend_index` |
 
 ---
 

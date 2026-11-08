@@ -10,6 +10,8 @@
 Author: stock_quant
 """
 
+import builtins
+import contextlib
 import json
 import logging
 import re
@@ -29,6 +31,30 @@ from core.trading_calendar import is_ignored_gap_range
 # 配置模块级日志
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+_PRINT_LOCAL = threading.local()
+_PRINT_PATCH_LOCK = threading.Lock()
+_ORIGINAL_PRINT = builtins.print
+
+
+def _thread_aware_print(*args, **kwargs):
+    if getattr(_PRINT_LOCAL, 'silence', False):
+        return
+    return _ORIGINAL_PRINT(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def _silence_thread_print():
+    """仅静默当前线程的 print，不影响其它线程输出。"""
+    with _PRINT_PATCH_LOCK:
+        old_print = builtins.print
+        builtins.print = _thread_aware_print
+        _PRINT_LOCAL.silence = True
+        try:
+            yield
+        finally:
+            _PRINT_LOCAL.silence = False
+            builtins.print = old_print
 
 # HTTP 请求头
 HEADERS = {
@@ -111,35 +137,34 @@ def _probe_baostock(timeout: float) -> float:
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(timeout)
     t0 = time.perf_counter()
-    try:
-        # 注意：不要在测速线程里使用 contextlib.redirect_stdout，
-        # 它是进程级全局状态，可能吞掉主线程后续输出。
-        login = bs.login()
-        if getattr(login, 'error_code', '0') != '0':
-            raise RuntimeError(
-                f"baostock 登录失败: {getattr(login, 'error_msg', '')}")
-
-        rs = bs.query_history_k_data_plus(
-            'sh.600036', 'date,open,high,low,close,volume',
-            start_date='2024-01-02', end_date='2024-01-02',
-            frequency='d', adjustflag='3')
-        if getattr(rs, 'error_code', '0') != '0':
-            raise RuntimeError(
-                f"baostock 查询失败: {getattr(rs, 'error_msg', '')}")
-        if not rs.next():
-            raise RuntimeError('baostock 返回空 K 线')
-        row = rs.get_row_data()
-        if len(row) < 6 or not row[1] or not row[2]:
-            raise RuntimeError('baostock K 线字段不完整')
-        for value in row[1:6]:
-            float(value)
-        return time.perf_counter() - t0
-    finally:
+    with _silence_thread_print():
         try:
-            bs.logout()
-        except Exception:
-            pass
-        socket.setdefaulttimeout(old_timeout)
+            login = bs.login()
+            if getattr(login, 'error_code', '0') != '0':
+                raise RuntimeError(
+                    f"baostock 登录失败: {getattr(login, 'error_msg', '')}")
+
+            rs = bs.query_history_k_data_plus(
+                'sh.600036', 'date,open,high,low,close,volume',
+                start_date='2024-01-02', end_date='2024-01-02',
+                frequency='d', adjustflag='3')
+            if getattr(rs, 'error_code', '0') != '0':
+                raise RuntimeError(
+                    f"baostock 查询失败: {getattr(rs, 'error_msg', '')}")
+            if not rs.next():
+                raise RuntimeError('baostock 返回空 K 线')
+            row = rs.get_row_data()
+            if len(row) < 6 or not row[1] or not row[2]:
+                raise RuntimeError('baostock K 线字段不完整')
+            for value in row[1:6]:
+                float(value)
+            return time.perf_counter() - t0
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+            socket.setdefaulttimeout(old_timeout)
 
 
 def run_source_speed_test(force: bool = False):
@@ -1607,11 +1632,40 @@ class DataFetcher:
             end_dt = pd.to_datetime(end_date)
             df = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)]
 
-            logger.info("指数数据返回 %d 条记录", len(df))
-            return self._standardize_dataframe(df)
+            if not df.empty:
+                first = df['date'].min()
+                # 新浪仅约 1000 根；起始日明显晚于请求起点时改用长历史源
+                if (first - start_dt).days <= 15:
+                    logger.info("指数数据返回 %d 条记录", len(df))
+                    return self._standardize_dataframe(df)
+                logger.warning(
+                    "新浪指数数据仅从 %s 开始，无法覆盖请求起点 %s，改用长历史源",
+                    first.date(), start_dt.date())
 
         except Exception as e:
             logger.error("获取指数数据失败: %s", str(e))
+
+        # 备选：AkShare 长历史指数接口
+        try:
+            import akshare as ak
+            raw_symbol = self._normalize_a_stock_symbol(symbol)
+            prefix = 'sz' if raw_symbol.startswith('399') else 'sh'
+            df = ak.stock_zh_index_daily(symbol=f'{prefix}{raw_symbol}')
+            if df is not None and not df.empty:
+                df = df.rename(columns=str.lower)
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                df = df.dropna(subset=['date'])
+                start_dt = pd.to_datetime(start_date)
+                end_dt = pd.to_datetime(end_date)
+                df = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)]
+                if not df.empty:
+                    logger.info("AkShare 指数数据返回 %d 条记录", len(df))
+                    return self._standardize_dataframe(df)
+        except Exception as e:
+            logger.warning("AkShare 获取指数数据失败: %s", str(e))
 
         # 备选：yfinance
         try:

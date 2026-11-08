@@ -262,6 +262,7 @@ venv/bin/python test/clean_daily_kline_holidays.py --apply
 ```toml
 [tool.stock-quant]
 position_style = "full"
+market_trend_index = "000852"   # 大盘趋势指数代码，默认中证1000
 
 [tool.stock-quant.service]
 SQ_RUN_TIME = "1445"
