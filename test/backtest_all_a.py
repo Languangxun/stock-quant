@@ -268,6 +268,23 @@ def _write_outputs(args, summaries, trades, equities, errors, elapsed):
                               ascending=[True, False])
     sdf.to_csv(summary_path, index=False, encoding='utf-8-sig')
 
+    top_paths = []
+    if args.top and len(sdf):
+        cols = ['code', 'name', 'strategy', 'total_return', 'annual_return',
+                'max_drawdown', 'sharpe_ratio', 'win_rate', 'total_trades',
+                'profit_factor', 'final_value', 'last_signal']
+        for strat_name, grp in sdf.groupby('strategy'):
+            ordered = grp.sort_values('total_return', ascending=False)
+            top_path = os.path.join(
+                out_dir, f'backtest_all_a_{tag}_top{args.top}_{strat_name}.csv')
+            bottom_path = os.path.join(
+                out_dir, f'backtest_all_a_{tag}_bottom{args.top}_{strat_name}.csv')
+            ordered.head(args.top)[cols].to_csv(
+                top_path, index=False, encoding='utf-8-sig')
+            ordered.tail(args.top)[cols].sort_values('total_return').to_csv(
+                bottom_path, index=False, encoding='utf-8-sig')
+            top_paths.extend([top_path, bottom_path])
+
     if len(sdf):
         grouped = sdf.groupby('strategy', dropna=False)
         strat = grouped.agg(
@@ -318,6 +335,8 @@ def _write_outputs(args, summaries, trades, equities, errors, elapsed):
         print(f'  交易明细:       {trades_path}')
     if eq_path:
         print(f'  权益曲线:       {eq_path}')
+    if top_paths:
+        print(f'  Top/Bottom:     {len(top_paths)} 个文件（目录 {out_dir}）')
     print(f'  异常记录:       {errors_path}')
     if len(strat):
         print()
@@ -374,6 +393,8 @@ def main():
                     help='最小总市值，单位亿元')
     ap.add_argument('--no-trades', action='store_true',
                     help='不导出交易明细 CSV')
+    ap.add_argument('--top', type=int, default=20,
+                    help='额外导出每个策略收益最高/最低 N 只（默认 20，0=不导出）')
     ap.add_argument('--equity', action='store_true',
                     help='额外导出每日权益曲线（文件较大）')
     args = ap.parse_args()

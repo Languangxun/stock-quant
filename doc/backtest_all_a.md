@@ -50,6 +50,8 @@ SQLite/网络行情
 | `backtest_all_a_<tag>_strategy_summary.csv` | 按策略汇总：股票数、平均/中位收益、平均回撤、平均夏普、正收益比例等 |
 | `backtest_all_a_<tag>_trades.csv` | 全部交易明细：买入/卖出日期、价格、股数、持仓天数、收益率、盈亏额、退出原因 |
 | `backtest_all_a_<tag>_errors.csv` | 无数据/异常标的 |
+| `backtest_all_a_<tag>_top20_<策略>.csv` | 每个策略收益最高的 20 只（`--top 0` 可关闭） |
+| `backtest_all_a_<tag>_bottom20_<策略>.csv` | 每个策略收益最低的 20 只 |
 
 读取 CSV 时建议把代码列指定为字符串，避免丢失前导零：
 
