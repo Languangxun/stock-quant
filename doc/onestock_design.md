@@ -59,14 +59,20 @@ python3 main.py backtest \
 | `-c` | 初始资金（万元） |
 | `--fixcapital` | 每次买入固定使用初始资金额度 |
 | `--maxholddays N` | 信号层最大持股限制 |
+| `--nodownbuy` / `--block-buy-on-downtrend` | 大盘趋势为“下跌”或“过热”时禁止买入；同时适用于 analyze/scan/backtest/compare |
+| `--downlosssell` | 下跌且持仓亏损>2%或单日跌幅>5%时卖出；上涨优先 MACD 买入信号，震荡/过冷优先 BOLL 买入信号 |
+| `--verbose` | `--onestock` 时在 HTML 报告中增加“指数K线 + 权益曲线 + 买卖三角”单图 |
 | `--seqnum/-sn` | BOLL 买入序号过滤 |
 | `--src` | 数据源选择 |
 
 注意：
 
 - `--onestock` 会直接返回，不进入普通批量回测/单股回溯路径；
-- `--chart`、`--verbose` 在 `--onestock` 下不生效；
-- 股票池为空、无有效数据、或策略中只有 `hold` 时直接报错返回。
+- `--chart` 在 `--onestock` 下不生效；`--verbose` 会生成指数K线/权益曲线单图并嵌入 HTML；
+- 股票池为空、无有效数据、或策略中只有 `hold` 时直接报错返回；
+- 大盘趋势为“过热”时始终禁止买入；开启 `--nodownbuy` 后“下跌”日也禁止买入；
+- 大盘趋势为“过冷”时忽略最大回撤、最大持股天数和亏损止损等强制卖出，常规策略卖出仍执行；
+- `--nodownbuy` 在 analyze / scan / backtest / compare 中均作用于策略原始买入信号。
 
 ---
 
@@ -238,6 +244,7 @@ return, holding_days, exit_reason
 |----|------|
 | `signal` | 持仓策略发出卖出信号 |
 | `replace` | `--onestock 1` 换股 |
+| `downloss` | 大盘下跌且持仓亏损>2%或单日跌幅>5%止损 |
 | `end` | 期末强制平仓 |
 
 ### 6.4 卖出优先级
@@ -245,14 +252,16 @@ return, holding_days, exit_reason
 每日循环顺序：
 
 1. 若持仓，且持仓策略当日信号 `< 0`：卖出，`continue`，**当日不再买入**；
-2. 若空仓且需要刷新随机池：刷新；
-3. 若空仓：寻找买入；
-4. 若持仓且 `N=1`：尝试换股；
-5. 记录当日权益。
+   （“过冷”时仅由最大回撤/最大持股天数触发的卖出已被抑制）
+2. 若开启 `--downlosssell`，大盘趋势为“下跌”，且当前价相对建仓价亏损超过 2% 或当日较前一交易日下跌超过 5%：卖出，**当日不再买入**；
+3. 若空仓且需要刷新随机池：刷新；
+4. 若空仓：寻找买入；
+5. 若持仓且 `N=1`：尝试换股；
+6. 记录当日权益。
 
 ### 6.5 买入选择顺序
 
-`_pick_buy(d)` 按：
+默认 `_pick_buy(d)` 按：
 
 ```text
 策略顺序（-g 的先后）
@@ -260,7 +269,17 @@ return, holding_days, exit_reason
     → 当日该策略信号 > 0 的第一只
 ```
 
-因此 `-g boll,macd` 表示 BOLL 优先于 MACD。
+因此 `-g boll,macd` 默认表示 BOLL 优先于 MACD。
+
+开启 `--downlosssell` 后，策略顺序会随当日大盘趋势调整：
+
+| 大盘趋势 | 优先策略 | 后续策略 |
+|----------|----------|----------|
+| `上涨` | MACD | 其余策略按 `-g` 顺序 |
+| `震荡` / `过冷` | BOLL | 其余策略按 `-g` 顺序 |
+| `下跌` / `过渡` / `过热` | 不调整 | 按 `-g` 顺序 |
+
+优先策略未包含在 `-g` 中或当日无买入信号时，自动回退到其余策略。
 
 ### 6.6 换股模式 `--onestock 1`
 
@@ -375,7 +394,8 @@ report/backtest_<file_part>_<start>_<end>_<strategy>_<mmddHHMM>_onestock.html
 - 阈值备注（最大回撤、RSI、PE、seqnum）；
 - 命令选项、软件版本；
 - “回测结果（按策略分类）”表；
-- “交易明细”表（屏幕始终不打印，HTML 保留）。
+- “交易明细”表（屏幕始终不打印，HTML 保留）；
+- 开启 `--verbose` 时增加“指数K线与权益曲线”单图：指数K线、权益曲线（次坐标轴）和买入红三角/卖出绿三角叠加在同一张图，不使用子图；指数K线位于下方、权益曲线位于上方，两者分区显示尽量减少交叉；权益曲线起点位于图表高度约 2/3 处；权益轴上下限根据权益数据自动设置，刻度按万元显示（如 200 表示 200 万，不带“万”后缀）；股票代码标注在买入三角下方。
 
 ### 9.3 返回值
 
@@ -387,6 +407,7 @@ report/backtest_<file_part>_<start>_<end>_<strategy>_<mmddHHMM>_onestock.html
     'trades': trades,
     'equity': equity,
     'html_path': html_path,
+    'chart_path': chart_path,
     'breakdown_headers': breakdown_headers,
     'breakdown_rows': breakdown_rows,
 }
@@ -424,8 +445,8 @@ CLI 调用方忽略返回值；测试脚本可直接使用交易记录和统计�
 5. **持仓天数按联合交易日历统计**：停牌或数据缺口可能使持仓天数偏大。
 6. **换股不刷新随机池**：随机模式下只有信号卖出后才刷新。
 7. **策略映射为通用策略**：不复用 analyze 的 ETF/指数专属参数。
-8. **`--chart` / `--verbose` 不生效**：`--onestock` 在批量回测和图表流程之前返回。
-9. **`--maxholddays` 只影响信号**：不改变 onestock 的资金和持仓规则。
+8. **`--chart` 不生效；`--verbose` 生效**：`--onestock` 不进入普通批量图表流程，但 `--verbose` 会额外生成指数K线与权益曲线单图并嵌入 HTML。
+9. **`--maxholddays` 只影响信号**：不改变 onestock 的资金和持仓规则；大盘“过冷”时该强制卖出被抑制。
 10. **报告文件名包含 `_onestock.html`**：避免与普通回测报告混淆。
 
 ---

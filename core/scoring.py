@@ -11,7 +11,7 @@ from functools import lru_cache
 import pandas as pd
 
 
-COMPONENT_ORDER = ('MA', 'EMA', 'DMI', 'AMT', 'RSI', 'WR', 'SAR', 'PE', 'KDJ')
+COMPONENT_ORDER = ('MA', 'EMA', 'DMI', 'AMT', 'OBV', 'RSI', 'WR', 'SAR', 'PE', 'KDJ')
 
 
 def _num(df, col):
@@ -68,6 +68,7 @@ def _component_frame(df):
     plus_di = _num(df, 'PLUS_DI')
     minus_di = _num(df, 'MINUS_DI')
     amount = _num(df, 'amount')
+    obv = _num(df, 'OBV')
     rsi = _num(df, 'RSI14')
     wr = _num(df, 'WR14')
     sar = _num(df, 'SAR')
@@ -96,6 +97,27 @@ def _component_frame(df):
         price_low = close <= close.rolling(5, min_periods=5).min()
         comp['AMT'] = (amt_high & price_high).astype(int)
         comp['AMT'] -= (amt_high & price_low).astype(int)
+
+    if obv is not None and adx is not None and plus_di is not None and minus_di is not None:
+        obv_ma20 = obv.rolling(20).mean()
+        obv_above_ma20 = obv > obv_ma20
+        rsi_lt30 = (rsi < 30) if rsi is not None else False
+        obv_buy = (
+            ((adx < 25) & rsi_lt30 & obv_above_ma20)
+            | ((adx > 25) & (plus_di > minus_di) & obv_above_ma20)
+        )
+        obv_sell = pd.Series(False, index=df.index)
+        if close is not None:
+            price_ma10 = ma10 if ma10 is not None else close.rolling(10).mean()
+            price_high10 = close >= close.rolling(10).max()
+            obv_not_high10 = obv < obv.rolling(10).max()
+            price_below_ma10 = close < price_ma10
+            obv_below_ma10 = obv < obv.rolling(10).mean()
+            obv_sell = (
+                ((adx > 25) & price_high10 & obv_not_high10)
+                | ((adx > 25) & price_below_ma10 & obv_below_ma10)
+            )
+        comp['OBV'] = obv_buy.astype(int) - obv_sell.astype(int)
 
     if rsi is not None:
         comp['RSI'] = (rsi < 30).astype(int)

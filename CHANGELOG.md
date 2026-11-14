@@ -1,6 +1,10 @@
 # Changelog
 本项目版本号统一维护在 `_version.py`，发布时只需修改该文件。
 
+## [3.0.0] - 2026-11-08
+- 增加大盘趋势分析，根据大盘趋势进行买卖过滤。回测收益率大幅提升！
+- 增加--onestock模式下的权益曲线图输出。
+
 ## [2.4.0] - 2026-11-08
 - 新增图形界面 `gui.py`，深色桌面风格参考 stock_predict/stock_gui.py。
 - GUI 覆盖 analyze / scan / backtest / compare / indicators 全部命令与参数，后台调用同一套 CLI，行为与命令行一致。

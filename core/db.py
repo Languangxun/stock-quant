@@ -370,6 +370,32 @@ def fetch_market_trade_dates(start_date: str, end_date: str,
         return []
 
 
+def fetch_market_breadth_counts(start_date: str, end_date: str,
+                                universe_code: str = 'ALL_A',
+                                force: bool = True) -> list:
+    """读取市场广度涨跌家数（按交易日期）。
+
+    Returns:
+        list[tuple[date, int, int]]: [(trade_date, advance_count, decline_count), ...]
+    """
+    try:
+        with get_connection(force=force) as conn:
+            if conn is None:
+                return []
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT trade_date, advance_count, decline_count
+                FROM market_breadth
+                WHERE universe_code = %s
+                  AND trade_date >= %s AND trade_date <= %s
+                ORDER BY trade_date
+            """, (universe_code, start_date, end_date))
+            return cursor.fetchall()
+    except Exception as e:
+        logger.warning("读取市场广度涨跌家数失败: %s", e)
+        return []
+
+
 def fetch_market_breadth_adl(start_date: str, end_date: str,
                              universe_code: str = 'ALL_A',
                              force: bool = True) -> list:

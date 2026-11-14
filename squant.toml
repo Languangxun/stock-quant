@@ -29,6 +29,7 @@ poolmgr = "poolmgr:poolmgr"
 
 [tool.stock-quant]
 position_style = "full"
+market_trend_index = "000852"
 
 [tool.stock-quant.service]
 SQ_RUN_TIME = "1445"
